@@ -8,6 +8,30 @@ endif()
 
 find_package(Git QUIET REQUIRED)
 
+# On MSVC, building the patched zlib shared target (zlib1.dll) fails with LNK2005
+# duplicate symbols. Open3D only links zlibstatic on Windows.
+if(MSVC)
+    set(ZLIB_EP_EXTRA_ARGS
+        BUILD_COMMAND
+            ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release --target zlibstatic
+        INSTALL_COMMAND
+            ${CMAKE_COMMAND} -E make_directory <INSTALL_DIR>/include <INSTALL_DIR>/lib
+            COMMAND ${CMAKE_COMMAND} -E copy
+                <BINARY_DIR>/Release/${CMAKE_STATIC_LIBRARY_PREFIX}${lib_name}${CMAKE_STATIC_LIBRARY_SUFFIX}
+                <INSTALL_DIR>/lib/${CMAKE_STATIC_LIBRARY_PREFIX}${lib_name}${CMAKE_STATIC_LIBRARY_SUFFIX}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                <SOURCE_DIR>/zlib.h <INSTALL_DIR>/include/zlib.h
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                <BINARY_DIR>/zconf.h <INSTALL_DIR>/include/zconf.h
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                <SOURCE_DIR>/contrib/minizip/unzip.h <INSTALL_DIR>/include/unzip.h
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                <SOURCE_DIR>/contrib/minizip/ioapi.h <INSTALL_DIR>/include/ioapi.h
+    )
+else()
+    set(ZLIB_EP_EXTRA_ARGS "")
+endif()
+
 ExternalProject_Add(
     ext_zlib
     PREFIX zlib
@@ -24,6 +48,7 @@ ExternalProject_Add(
         # zlib needs visible symbols for examples. Disabling example building causes
         # assember error in GPU CI. zlib symbols are hidden during linking.
         ${ExternalProject_CMAKE_ARGS}
+    ${ZLIB_EP_EXTRA_ARGS}
     BUILD_BYPRODUCTS
         <INSTALL_DIR>/lib/${CMAKE_STATIC_LIBRARY_PREFIX}${lib_name}${CMAKE_STATIC_LIBRARY_SUFFIX}
         <INSTALL_DIR>/lib/${CMAKE_STATIC_LIBRARY_PREFIX}${lib_name}d${CMAKE_STATIC_LIBRARY_SUFFIX}

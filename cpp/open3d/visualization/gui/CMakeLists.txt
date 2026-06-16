@@ -67,6 +67,17 @@ open3d_show_and_abort_on_warning(GUI)
 open3d_set_global_properties(GUI)
 open3d_link_3rdparty_libraries(GUI)
 
+# Prefer bundled Dear ImGui headers over system installs (e.g. vcpkg) that
+# MSVC user props may inject ahead of external include paths.
+if(NOT USE_SYSTEM_IMGUI)
+    target_include_directories(GUI BEFORE PRIVATE
+        "${CMAKE_BINARY_DIR}/_deps/ext_imgui-src")
+    if(MSVC)
+        target_compile_options(GUI PRIVATE
+            "/I${CMAKE_BINARY_DIR}/_deps/ext_imgui-src")
+    endif()
+endif()
+
 # --- build resources ----
 file(GLOB GUI_RESOURCE_SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/Resources/*")
 

@@ -18,6 +18,17 @@ macro(open3d_add_example EXAMPLE_CPP_NAME)
         RUNTIME_OUTPUT_DIRECTORY "${EXAMPLE_BIN_DIR}"
     )
 
+    # TBB is linked as a shared library on Windows; copy its DLL next to the
+    # example executable so it can be launched from the output directory.
+    if(WIN32 AND TARGET tbb)
+        add_custom_command(TARGET ${EXAMPLE_CPP_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:tbb>
+                "$<TARGET_FILE_DIR:${EXAMPLE_CPP_NAME}>"
+            COMMENT "Copying tbb runtime DLL for ${EXAMPLE_CPP_NAME}"
+        )
+    endif()
+
     if (NOT BUILD_EXAMPLES)
         set_target_properties(${EXAMPLE_CPP_NAME} PROPERTIES
             EXCLUDE_FROM_ALL TRUE

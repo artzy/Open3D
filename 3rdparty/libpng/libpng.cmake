@@ -20,6 +20,8 @@ ExternalProject_Add(
         -DPNG_TOOLS=OFF
         -DPNG_TESTS=OFF
         -DZLIB_ROOT=${CMAKE_BINARY_DIR}/zlib
+        -DZLIB_INCLUDE_DIR=${CMAKE_BINARY_DIR}/zlib/include
+        -DZLIB_LIBRARY=${CMAKE_BINARY_DIR}/zlib/lib/zlibstatic.lib
         -DPNG_ARM_NEON=off # Must be lower case.
         ${ExternalProject_CMAKE_ARGS_hidden}
     DEPENDS ext_zlib
