@@ -7,6 +7,8 @@
 
 #include "open3d/t/pipelines/slam/Model.h"
 
+#include <unordered_set>
+
 #include "open3d/core/Tensor.h"
 #include "open3d/t/geometry/Image.h"
 #include "open3d/t/geometry/RGBDImage.h"
@@ -19,6 +21,63 @@ namespace open3d {
 namespace t {
 namespace pipelines {
 namespace slam {
+
+namespace {
+
+struct BlockKey {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+    bool operator==(const BlockKey& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct BlockKeyHash {
+    size_t operator()(const BlockKey& key) const {
+        return (static_cast<size_t>(static_cast<uint32_t>(key.x)) * 73856093u) ^
+               (static_cast<size_t>(static_cast<uint32_t>(key.y)) * 19349663u) ^
+               (static_cast<size_t>(static_cast<uint32_t>(key.z)) * 83492791u);
+    }
+};
+
+std::unordered_set<BlockKey, BlockKeyHash> BuildBlockKeySet(
+        const core::Tensor& block_keys) {
+    std::unordered_set<BlockKey, BlockKeyHash> key_set;
+    if (block_keys.NumElements() == 0) {
+        return key_set;
+    }
+    core::Tensor keys_cpu = block_keys.To(core::Device("CPU:0")).Contiguous();
+    const int64_t n = keys_cpu.GetLength();
+    const int32_t* data = keys_cpu.GetDataPtr<int32_t>();
+    key_set.reserve(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        key_set.insert({data[i * 3 + 0], data[i * 3 + 1], data[i * 3 + 2]});
+    }
+    return key_set;
+}
+
+core::Tensor MergeBlockKeys(const core::Tensor& existing_keys,
+                            const core::Tensor& new_keys) {
+    std::unordered_set<BlockKey, BlockKeyHash> merged =
+            BuildBlockKeySet(existing_keys);
+    const std::unordered_set<BlockKey, BlockKeyHash> incoming =
+            BuildBlockKeySet(new_keys);
+    merged.insert(incoming.begin(), incoming.end());
+
+    std::vector<int32_t> flat;
+    flat.reserve(merged.size() * 3);
+    for (const auto& key : merged) {
+        flat.push_back(key.x);
+        flat.push_back(key.y);
+        flat.push_back(key.z);
+    }
+    return core::Tensor(flat,
+                        {static_cast<int64_t>(merged.size()), 3},
+                        core::Int32, core::Device("CPU:0"));
+}
+
+}  // namespace
 
 Model::Model(float voxel_size,
              int block_resolution,
@@ -113,6 +172,35 @@ t::geometry::PointCloud Model::ExtractPointCloud(float weight_threshold,
 t::geometry::TriangleMesh Model::ExtractTriangleMesh(float weight_threshold,
                                                      int estimated_number) {
     return voxel_grid_.ExtractTriangleMesh(weight_threshold, estimated_number);
+}
+
+void Model::FreezeBlocks(const core::Tensor& block_keys) {
+    if (block_keys.NumElements() == 0) {
+        return;
+    }
+    frozen_block_keys_ = MergeBlockKeys(frozen_block_keys_, block_keys);
+}
+
+core::Tensor Model::GetFrozenBlockKeys() const { return frozen_block_keys_; }
+
+t::geometry::PointCloud Model::ExtractPointCloudExcludingFrozen(
+        float weight_threshold,
+        int estimated_number) {
+    if (frozen_block_keys_.NumElements() == 0) {
+        return ExtractPointCloud(weight_threshold, estimated_number);
+    }
+    return voxel_grid_.ExtractPointCloudExcluding(weight_threshold,
+                                                  estimated_number,
+                                                  frozen_block_keys_);
+}
+
+t::geometry::TriangleMesh Model::ExtractTriangleMeshIncluding(
+        float weight_threshold,
+        int estimated_number,
+        const core::Tensor& include_block_keys) {
+    return voxel_grid_.ExtractTriangleMeshIncluding(weight_threshold,
+                                                    estimated_number,
+                                                    include_block_keys);
 }
 
 core::HashMap Model::GetHashMap() { return voxel_grid_.GetHashMap(); }

@@ -230,6 +230,41 @@ TEST_P(VoxelBlockGridPermuteDevices, GetUniqueBlockCoordinates) {
     }
 }
 
+TEST_P(VoxelBlockGridPermuteDevices, ExtractExcludingBlocks) {
+    core::Device device = GetParam();
+    std::vector<core::HashBackendType> backends = EnumerateBackends(device);
+
+    for (auto backend : backends) {
+        auto vbg = Integrate(backend, core::UInt16, device, 8);
+        auto full_pcd = vbg.ExtractPointCloud();
+        const int64_t full_count = full_pcd.GetPointPositions().GetLength();
+        ASSERT_GT(full_count, 0);
+
+        core::Tensor active_buf_indices = vbg.GetHashMap().GetActiveIndices();
+        core::Tensor all_keys = vbg.GetHashMap().GetKeyTensor();
+        core::Tensor active_keys =
+                all_keys.IndexGet({active_buf_indices.To(core::Int64)});
+        const int64_t half = active_keys.GetLength() / 2;
+        ASSERT_GT(half, 0);
+
+        core::Tensor exclude_keys =
+                active_keys.Slice(0, 0, half).To(core::Device("CPU:0"));
+        auto partial_pcd =
+                vbg.ExtractPointCloudExcluding(3.0, -1, exclude_keys);
+        const int64_t partial_count =
+                partial_pcd.GetPointPositions().GetLength();
+        EXPECT_LT(partial_count, full_count);
+        EXPECT_GT(partial_count, 0);
+
+        auto include_pcd =
+                vbg.ExtractPointCloudIncluding(3.0, -1, exclude_keys);
+        const int64_t include_count =
+                include_pcd.GetPointPositions().GetLength();
+        EXPECT_GT(include_count, 0);
+        EXPECT_LT(include_count, full_count);
+    }
+}
+
 TEST_P(VoxelBlockGridPermuteDevices, Integrate) {
     core::Device device = GetParam();
     std::vector<core::HashBackendType> backends = EnumerateBackends(device);

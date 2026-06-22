@@ -200,6 +200,23 @@ public:
     PointCloud ExtractPointCloud(float weight_threshold = 3.0f,
                                  int estimated_point_number = -1);
 
+    /// Extract point cloud from active blocks whose keys are not in
+    /// \p exclude_block_keys. Empty \p exclude_block_keys is equivalent to
+    /// ExtractPointCloud().
+    /// \p exclude_block_keys must be an (N, 3) Int32 tensor on CPU.
+    PointCloud ExtractPointCloudExcluding(
+            float weight_threshold,
+            int estimated_point_number,
+            const core::Tensor &exclude_block_keys);
+
+    /// Extract point cloud only from blocks listed in \p include_block_keys.
+    /// Empty \p include_block_keys returns an empty point cloud.
+    /// \p include_block_keys must be an (N, 3) Int32 tensor on CPU.
+    PointCloud ExtractPointCloudIncluding(
+            float weight_threshold,
+            int estimated_point_number,
+            const core::Tensor &include_block_keys);
+
     /// Specific operation for TSDF volumes.
     /// Extract mesh near iso-surfaces with Marching Cubes.
     /// Weight threshold is used to filter outliers. By default we use 3.0,
@@ -211,6 +228,20 @@ public:
     /// available.
     TriangleMesh ExtractTriangleMesh(float weight_threshold = 3.0f,
                                      int estimated_vertex_numer = -1);
+
+    /// Extract mesh from active blocks excluding \p exclude_block_keys.
+    /// \p exclude_block_keys must be an (N, 3) Int32 tensor on CPU.
+    TriangleMesh ExtractTriangleMeshExcluding(
+            float weight_threshold,
+            int estimated_vertex_number,
+            const core::Tensor &exclude_block_keys);
+
+    /// Extract mesh only from blocks listed in \p include_block_keys.
+    /// \p include_block_keys must be an (N, 3) Int32 tensor on CPU.
+    TriangleMesh ExtractTriangleMeshIncluding(
+            float weight_threshold,
+            int estimated_vertex_number,
+            const core::Tensor &include_block_keys);
 
     /// Save a voxel block grid to a .npz file.
     void Save(const std::string &file_name) const;

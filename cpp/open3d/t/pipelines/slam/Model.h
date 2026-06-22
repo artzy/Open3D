@@ -114,6 +114,25 @@ public:
     t::geometry::TriangleMesh ExtractTriangleMesh(float weight_threshold = 3.0f,
                                                   int estimated_number = -1);
 
+    /// Mark TSDF blocks as frozen. Frozen blocks remain integrated but are
+    /// excluded from ExtractPointCloudExcludingFrozen.
+    /// \p block_keys must be an (N, 3) Int32 tensor on CPU.
+    void FreezeBlocks(const core::Tensor& block_keys);
+
+    /// Returns merged frozen block keys as an (M, 3) Int32 CPU tensor.
+    core::Tensor GetFrozenBlockKeys() const;
+
+    /// Extract point cloud excluding frozen blocks.
+    t::geometry::PointCloud ExtractPointCloudExcludingFrozen(
+            float weight_threshold = 3.0f,
+            int estimated_number = -1);
+
+    /// Extract mesh only from the given block keys.
+    t::geometry::TriangleMesh ExtractTriangleMeshIncluding(
+            float weight_threshold,
+            int estimated_number,
+            const core::Tensor& include_block_keys);
+
     /// Get block hashmap int the VoxelBlockGrid.
     core::HashMap GetHashMap();
 
@@ -129,6 +148,9 @@ public:
     core::Tensor T_frame_to_world_;
 
     int frame_id_ = -1;
+
+    /// Frozen TSDF block keys (M, 3) Int32 on CPU.
+    core::Tensor frozen_block_keys_;
 };
 
 }  // namespace slam

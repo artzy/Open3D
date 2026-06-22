@@ -7,6 +7,8 @@
 
 #include "open3d/t/geometry/VoxelBlockGrid.h"
 
+#include <unordered_set>
+
 #include "open3d/core/Tensor.h"
 #include "open3d/t/geometry/Geometry.h"
 #include "open3d/t/geometry/PointCloud.h"
@@ -49,6 +51,96 @@ static std::pair<core::Tensor, core::Tensor> BufferRadiusNeighbors(
     return std::make_pair(buf_indices_nb.View({27, n, 1}),
                           masks_nb.View({27, n, 1}));
 }
+
+namespace {
+
+struct BlockKey {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+    bool operator==(const BlockKey &other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct BlockKeyHash {
+    size_t operator()(const BlockKey &key) const {
+        return (static_cast<size_t>(static_cast<uint32_t>(key.x)) * 73856093u) ^
+               (static_cast<size_t>(static_cast<uint32_t>(key.y)) * 19349663u) ^
+               (static_cast<size_t>(static_cast<uint32_t>(key.z)) * 83492791u);
+    }
+};
+
+std::unordered_set<BlockKey, BlockKeyHash> BuildBlockKeySet(
+        const core::Tensor &block_keys) {
+    std::unordered_set<BlockKey, BlockKeyHash> key_set;
+    if (block_keys.NumElements() == 0) {
+        return key_set;
+    }
+    if (block_keys.GetShape().size() != 2 ||
+        block_keys.GetShape()[1] != 3) {
+        utility::LogError(
+                "block_keys must have shape (N, 3), but got shape {}.",
+                block_keys.GetShape());
+    }
+    if (block_keys.GetDtype() != core::Int32) {
+        utility::LogError("block_keys must be Int32, but got {}.",
+                          block_keys.GetDtype().ToString());
+    }
+    core::Tensor keys_cpu = block_keys.To(core::Device("CPU:0")).Contiguous();
+    const int64_t n = keys_cpu.GetLength();
+    const int32_t *data = keys_cpu.GetDataPtr<int32_t>();
+    key_set.reserve(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        key_set.insert({data[i * 3 + 0], data[i * 3 + 1], data[i * 3 + 2]});
+    }
+    return key_set;
+}
+
+core::Tensor FilterActiveBufIndices(
+        const core::HashMap &hashmap,
+        const core::Tensor &active_buf_indices,
+        const core::Tensor &filter_block_keys,
+        bool exclude_mode) {
+    if (filter_block_keys.NumElements() == 0) {
+        if (exclude_mode) {
+            return active_buf_indices;
+        }
+        return core::Tensor({}, core::Int32, hashmap.GetDevice());
+    }
+
+    const std::unordered_set<BlockKey, BlockKeyHash> filter_keys =
+            BuildBlockKeySet(filter_block_keys);
+    core::Tensor all_keys = hashmap.GetKeyTensor();
+    core::Tensor active_keys =
+            all_keys.IndexGet({active_buf_indices.To(core::Int64)});
+
+    core::Tensor active_keys_cpu =
+            active_keys.To(core::Device("CPU:0")).Contiguous();
+    core::Tensor active_buf_cpu =
+            active_buf_indices.To(core::Device("CPU:0")).Contiguous();
+    const int64_t n = active_keys_cpu.GetLength();
+    const int32_t *key_data = active_keys_cpu.GetDataPtr<int32_t>();
+    const int32_t *buf_data = active_buf_cpu.GetDataPtr<int32_t>();
+
+    std::vector<int32_t> kept_buf_indices;
+    kept_buf_indices.reserve(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        const BlockKey key = {key_data[i * 3 + 0], key_data[i * 3 + 1],
+                              key_data[i * 3 + 2]};
+        const bool in_filter = filter_keys.find(key) != filter_keys.end();
+        const bool keep = exclude_mode ? !in_filter : in_filter;
+        if (keep) {
+            kept_buf_indices.push_back(buf_data[i]);
+        }
+    }
+
+    return core::Tensor(kept_buf_indices,
+                        {static_cast<int64_t>(kept_buf_indices.size())},
+                        core::Int32, hashmap.GetDevice());
+}
+
+}  // namespace
 
 static TensorMap ConstructTensorMap(
         const core::HashMap &block_hashmap,
@@ -433,6 +525,82 @@ PointCloud VoxelBlockGrid::ExtractPointCloud(float weight_threshold,
     return pcd;
 }
 
+PointCloud VoxelBlockGrid::ExtractPointCloudExcluding(
+        float weight_threshold,
+        int estimated_point_number,
+        const core::Tensor &exclude_block_keys) {
+    AssertInitialized();
+    core::Tensor active_buf_indices;
+    block_hashmap_->GetActiveIndices(active_buf_indices);
+    active_buf_indices = FilterActiveBufIndices(*block_hashmap_,
+                                                active_buf_indices,
+                                                exclude_block_keys, true);
+    if (active_buf_indices.GetLength() == 0) {
+        return PointCloud(block_hashmap_->GetDevice());
+    }
+
+    core::Tensor active_nb_buf_indices, active_nb_masks;
+    std::tie(active_nb_buf_indices, active_nb_masks) =
+            BufferRadiusNeighbors(block_hashmap_, active_buf_indices);
+
+    core::Tensor points, normals, colors;
+    core::Tensor block_keys = block_hashmap_->GetKeyTensor();
+    TensorMap block_value_map =
+            ConstructTensorMap(*block_hashmap_, name_attr_map_);
+    kernel::voxel_grid::ExtractPointCloud(
+            active_buf_indices, active_nb_buf_indices, active_nb_masks,
+            block_keys, block_value_map, points, normals, colors,
+            block_resolution_, voxel_size_, weight_threshold,
+            estimated_point_number);
+
+    auto pcd = PointCloud(points.Slice(0, 0, estimated_point_number));
+    pcd.SetPointNormals(normals.Slice(0, 0, estimated_point_number));
+
+    if (colors.GetLength() == normals.GetLength()) {
+        pcd.SetPointColors(colors.Slice(0, 0, estimated_point_number));
+    }
+
+    return pcd;
+}
+
+PointCloud VoxelBlockGrid::ExtractPointCloudIncluding(
+        float weight_threshold,
+        int estimated_point_number,
+        const core::Tensor &include_block_keys) {
+    AssertInitialized();
+    core::Tensor active_buf_indices;
+    block_hashmap_->GetActiveIndices(active_buf_indices);
+    active_buf_indices = FilterActiveBufIndices(*block_hashmap_,
+                                                active_buf_indices,
+                                                include_block_keys, false);
+    if (active_buf_indices.GetLength() == 0) {
+        return PointCloud(block_hashmap_->GetDevice());
+    }
+
+    core::Tensor active_nb_buf_indices, active_nb_masks;
+    std::tie(active_nb_buf_indices, active_nb_masks) =
+            BufferRadiusNeighbors(block_hashmap_, active_buf_indices);
+
+    core::Tensor points, normals, colors;
+    core::Tensor block_keys = block_hashmap_->GetKeyTensor();
+    TensorMap block_value_map =
+            ConstructTensorMap(*block_hashmap_, name_attr_map_);
+    kernel::voxel_grid::ExtractPointCloud(
+            active_buf_indices, active_nb_buf_indices, active_nb_masks,
+            block_keys, block_value_map, points, normals, colors,
+            block_resolution_, voxel_size_, weight_threshold,
+            estimated_point_number);
+
+    auto pcd = PointCloud(points.Slice(0, 0, estimated_point_number));
+    pcd.SetPointNormals(normals.Slice(0, 0, estimated_point_number));
+
+    if (colors.GetLength() == normals.GetLength()) {
+        pcd.SetPointColors(colors.Slice(0, 0, estimated_point_number));
+    }
+
+    return pcd;
+}
+
 TriangleMesh VoxelBlockGrid::ExtractTriangleMesh(float weight_threshold,
                                                  int estimated_vertex_number) {
     AssertInitialized();
@@ -468,6 +636,96 @@ TriangleMesh VoxelBlockGrid::ExtractTriangleMesh(float weight_threshold,
         mesh.SetVertexColors(vertex_colors);
     }
 
+    return mesh;
+}
+
+TriangleMesh VoxelBlockGrid::ExtractTriangleMeshExcluding(
+        float weight_threshold,
+        int estimated_vertex_number,
+        const core::Tensor &exclude_block_keys) {
+    AssertInitialized();
+    core::Tensor active_buf_indices_i32;
+    block_hashmap_->GetActiveIndices(active_buf_indices_i32);
+    active_buf_indices_i32 =
+            FilterActiveBufIndices(*block_hashmap_, active_buf_indices_i32,
+                                   exclude_block_keys, true);
+    if (active_buf_indices_i32.GetLength() == 0) {
+        return TriangleMesh(block_hashmap_->GetDevice());
+    }
+
+    core::Tensor active_nb_buf_indices, active_nb_masks;
+    std::tie(active_nb_buf_indices, active_nb_masks) =
+            BufferRadiusNeighbors(block_hashmap_, active_buf_indices_i32);
+
+    core::Device device = block_hashmap_->GetDevice();
+    int64_t num_blocks = block_hashmap_->Size();
+    core::Tensor inverse_index_map({block_hashmap_->GetCapacity()}, core::Int32,
+                                   device);
+    core::Tensor iota_map =
+            core::Tensor::Arange(0, num_blocks, 1, core::Int32, device);
+    inverse_index_map.IndexSet({active_buf_indices_i32.To(core::Int64)},
+                               iota_map);
+
+    core::Tensor vertices, triangles, vertex_normals, vertex_colors;
+    core::Tensor block_keys = block_hashmap_->GetKeyTensor();
+    TensorMap block_value_map =
+            ConstructTensorMap(*block_hashmap_, name_attr_map_);
+    kernel::voxel_grid::ExtractTriangleMesh(
+            active_buf_indices_i32, inverse_index_map, active_nb_buf_indices,
+            active_nb_masks, block_keys, block_value_map, vertices, triangles,
+            vertex_normals, vertex_colors, block_resolution_, voxel_size_,
+            weight_threshold, estimated_vertex_number);
+
+    TriangleMesh mesh(vertices, triangles);
+    mesh.SetVertexNormals(vertex_normals);
+    if (vertex_colors.GetLength() == vertices.GetLength()) {
+        mesh.SetVertexColors(vertex_colors);
+    }
+    return mesh;
+}
+
+TriangleMesh VoxelBlockGrid::ExtractTriangleMeshIncluding(
+        float weight_threshold,
+        int estimated_vertex_number,
+        const core::Tensor &include_block_keys) {
+    AssertInitialized();
+    core::Tensor active_buf_indices_i32;
+    block_hashmap_->GetActiveIndices(active_buf_indices_i32);
+    active_buf_indices_i32 =
+            FilterActiveBufIndices(*block_hashmap_, active_buf_indices_i32,
+                                   include_block_keys, false);
+    if (active_buf_indices_i32.GetLength() == 0) {
+        return TriangleMesh(block_hashmap_->GetDevice());
+    }
+
+    core::Tensor active_nb_buf_indices, active_nb_masks;
+    std::tie(active_nb_buf_indices, active_nb_masks) =
+            BufferRadiusNeighbors(block_hashmap_, active_buf_indices_i32);
+
+    core::Device device = block_hashmap_->GetDevice();
+    int64_t num_blocks = block_hashmap_->Size();
+    core::Tensor inverse_index_map({block_hashmap_->GetCapacity()}, core::Int32,
+                                   device);
+    core::Tensor iota_map =
+            core::Tensor::Arange(0, num_blocks, 1, core::Int32, device);
+    inverse_index_map.IndexSet({active_buf_indices_i32.To(core::Int64)},
+                               iota_map);
+
+    core::Tensor vertices, triangles, vertex_normals, vertex_colors;
+    core::Tensor block_keys = block_hashmap_->GetKeyTensor();
+    TensorMap block_value_map =
+            ConstructTensorMap(*block_hashmap_, name_attr_map_);
+    kernel::voxel_grid::ExtractTriangleMesh(
+            active_buf_indices_i32, inverse_index_map, active_nb_buf_indices,
+            active_nb_masks, block_keys, block_value_map, vertices, triangles,
+            vertex_normals, vertex_colors, block_resolution_, voxel_size_,
+            weight_threshold, estimated_vertex_number);
+
+    TriangleMesh mesh(vertices, triangles);
+    mesh.SetVertexNormals(vertex_normals);
+    if (vertex_colors.GetLength() == vertices.GetLength()) {
+        mesh.SetVertexColors(vertex_colors);
+    }
     return mesh;
 }
 
