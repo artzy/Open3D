@@ -30,11 +30,18 @@
 #include <thread>
 
 #include "open3d/Open3D.h"
+#include "IncrementalMeshFreeze.h"
 
 namespace {
 
 using namespace open3d;
 namespace tio = open3d::t::io;
+
+struct FreezeParams {
+    bool auto_freeze = true;
+    int freeze_interval = 0;
+    examples::IncrementalFreezeConfig config;
+};
 
 struct SlamParams {
     float voxel_size = 3.f / 512.f;
@@ -97,6 +104,15 @@ void PrintHelp() {
     utility::LogInfo("    [--estimated_points N]  Extract buffer size (auto-scales with hash).");
     utility::LogInfo("    [--block_count N]       TSDF hash block capacity (default: profile).");
     utility::LogInfo("");
+    utility::LogInfo("Incremental mesh freeze (default: on):");
+    utility::LogInfo("    [--no-auto_freeze]      Disable stable-cluster mesh freeze.");
+    utility::LogInfo("    [--auto_freeze]         Enable mesh freeze (default).");
+    utility::LogInfo("    [--freeze_interval N]   Analyze surface every N frames");
+    utility::LogInfo("                             (default: same as --update_interval).");
+    utility::LogInfo("    [--min_cluster_points N]  Min points per cluster (default: 5000).");
+    utility::LogInfo("    [--stability_frames N]  Frames before freeze (default: 5).");
+    utility::LogInfo("    [--objects_dir PATH]    Output dir for frozen meshes (default: objects).");
+    utility::LogInfo("");
     utility::LogInfo("Indoor room scan tips:");
     utility::LogInfo("    Walk slowly (~0.3 m/s), keep 30%% overlap between views.");
     utility::LogInfo("    Use --profile high --depth_max 8 for large rooms.");
@@ -104,8 +120,12 @@ void PrintHelp() {
     utility::LogInfo("");
     utility::LogInfo("Output (on window close / ESC):");
     utility::LogInfo("    scene.ply        Reconstructed point cloud");
-    utility::LogInfo("    scene_mesh.ply   Reconstructed triangle mesh");
+    utility::LogInfo("    scene_mesh.ply   Reconstructed triangle mesh (unfrozen remainder)");
+    utility::LogInfo("    objects/         Frozen meshes + pcd snapshots + frozen_blocks.json");
     utility::LogInfo("    trajectory.log   Camera trajectory (strong tracking only)");
+    utility::LogInfo("");
+    utility::LogInfo("Freeze note: stable clusters become meshes and are excluded from");
+    utility::LogInfo("    live point cloud display; TSDF voxels are not physically deleted.");
     utility::LogInfo("");
     utility::LogInfo("Note: sudden fast motion may pause integration; move slowly");
     utility::LogInfo("      back to the scanned area to resume reconstruction.");
@@ -229,6 +249,15 @@ bool ShouldRefreshDisplay(int frame_id, int update_interval) {
            (frame_id > 0 && frame_id % update_interval == 0);
 }
 
+bool ShouldRefreshFreeze(int frame_id, int freeze_interval) {
+    return frame_id == 3 ||
+           (frame_id > 0 && frame_id % freeze_interval == 0);
+}
+
+int EffectiveFreezeInterval(int freeze_interval, int update_interval) {
+    return freeze_interval > 0 ? freeze_interval : update_interval;
+}
+
 class SharedState {
 public:
     void SetPointCloud(std::shared_ptr<geometry::PointCloud> pcd) {
@@ -245,6 +274,39 @@ public:
         out = display_pcd_;
         has_update_ = false;
         return out != nullptr;
+    }
+
+    void AddFrozenMeshes(
+            const std::vector<std::shared_ptr<geometry::TriangleMesh>>& meshes) {
+        if (meshes.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_meshes_.insert(pending_meshes_.end(), meshes.begin(),
+                               meshes.end());
+        has_mesh_update_ = true;
+    }
+
+    bool TakeNewFrozenMeshes(
+            std::vector<std::shared_ptr<geometry::TriangleMesh>>& out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!has_mesh_update_) {
+            return false;
+        }
+        out = std::move(pending_meshes_);
+        pending_meshes_.clear();
+        has_mesh_update_ = false;
+        return !out.empty();
+    }
+
+    void SetFrozenCount(int count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        frozen_count_ = count;
+    }
+
+    int FrozenCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return frozen_count_;
     }
 
     void SetStatus(const std::string& status) {
@@ -264,6 +326,9 @@ private:
     mutable std::mutex mutex_;
     std::shared_ptr<geometry::PointCloud> display_pcd_;
     bool has_update_ = false;
+    std::vector<std::shared_ptr<geometry::TriangleMesh>> pending_meshes_;
+    bool has_mesh_update_ = false;
+    int frozen_count_ = 0;
     std::string status_;
 };
 
@@ -280,6 +345,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 const camera::PinholeCameraIntrinsic& cam_intrinsic,
                 const core::Device& device,
                 SlamParams params,
+                FreezeParams freeze_params,
                 SharedState& state) {
     using t::pipelines::slam::Frame;
     using t::pipelines::slam::Model;
@@ -330,6 +396,12 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
     bool tracking_was_unstable = false;
     int empty_capture_retries = 0;
     bool hash_full_warned = false;
+
+    examples::IncrementalMeshFreeze mesh_freeze(freeze_params.config);
+    const int freeze_interval =
+            EffectiveFreezeInterval(freeze_params.freeze_interval,
+                                    params.update_interval);
+    static constexpr int kMaxFrozenMeshWarning = 50;
 
     int frame_id = 0;
     while (!state.request_stop.load()) {
@@ -505,17 +577,57 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             trajectory->parameters_.push_back(cam_params);
         }
 
-        if (ShouldRefreshDisplay(frame_id, params.update_interval)) {
+        const bool refresh_display =
+                ShouldRefreshDisplay(frame_id, params.update_interval);
+        const bool refresh_freeze =
+                freeze_params.auto_freeze &&
+                ShouldRefreshFreeze(frame_id, freeze_interval);
+
+        if (refresh_display || refresh_freeze) {
             const float weight = ExtractWeightThreshold(frame_id);
             const int extract_budget =
                     GetExtractPointBudget(params.estimated_points,
                                           hash_size_before);
             try {
-                auto pcd_t = model.ExtractPointCloud(weight, extract_budget);
-                auto pcd =
-                        std::make_shared<geometry::PointCloud>(pcd_t.ToLegacy());
-                if (!pcd->IsEmpty()) {
-                    state.SetPointCloud(pcd);
+                t::geometry::PointCloud pcd_t;
+                if (freeze_params.auto_freeze) {
+                    pcd_t = model.ExtractPointCloudExcludingFrozen(
+                            weight, extract_budget);
+                } else {
+                    pcd_t = model.ExtractPointCloud(weight, extract_budget);
+                }
+
+                if (refresh_freeze && !pcd_t.IsEmpty()) {
+                    auto new_frozen = mesh_freeze.ProcessSurface(
+                            pcd_t.To(core::Device("CPU:0")), model);
+                    if (!new_frozen.empty()) {
+                        std::vector<std::shared_ptr<geometry::TriangleMesh>>
+                                mesh_ptrs;
+                        mesh_ptrs.reserve(new_frozen.size());
+                        for (const auto& entry : new_frozen) {
+                            mesh_ptrs.push_back(
+                                    std::make_shared<geometry::TriangleMesh>(
+                                            entry.mesh_legacy));
+                        }
+                        state.AddFrozenMeshes(mesh_ptrs);
+                        state.SetFrozenCount(mesh_freeze.FrozenCount());
+                        if (mesh_freeze.FrozenCount() >= kMaxFrozenMeshWarning) {
+                            utility::LogWarning(
+                                    "{} frozen meshes — consider finishing the "
+                                    "scan.",
+                                    mesh_freeze.FrozenCount());
+                        }
+                        pcd_t = model.ExtractPointCloudExcludingFrozen(
+                                weight, extract_budget);
+                    }
+                }
+
+                if (refresh_display) {
+                    auto pcd = std::make_shared<geometry::PointCloud>(
+                            pcd_t.ToLegacy());
+                    if (!pcd->IsEmpty()) {
+                        state.SetPointCloud(pcd);
+                    }
                 }
             } catch (const std::exception& e) {
                 utility::LogWarning("Live extract skipped at frame {}: {}",
@@ -526,6 +638,9 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         std::string status = "Frame " + std::to_string(frame_id) + " | blocks " +
                              std::to_string(hash_size_before) + "/" +
                              std::to_string(hash_capacity);
+        if (freeze_params.auto_freeze && state.FrozenCount() > 0) {
+            status += " | frozen " + std::to_string(state.FrozenCount());
+        }
         if (hash_near_full) {
             status += " | HASH FULL";
         } else if (consecutive_tracking_failures > kLostTrackingThreshold) {
@@ -549,21 +664,30 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             final_hash_size);
 
     try {
-        // estimated_number=-1: two-pass extract, no truncation warning.
-        auto final_pcd_t = model.ExtractPointCloud(3.f, -1);
+        t::geometry::PointCloud final_pcd_t;
+        t::geometry::TriangleMesh final_mesh_t;
+        if (freeze_params.auto_freeze) {
+            final_pcd_t = model.ExtractPointCloudExcludingFrozen(3.f, -1);
+            final_mesh_t = model.ExtractTriangleMesh(3.f, -1);
+            mesh_freeze.SaveAllArtifacts();
+        } else {
+            final_pcd_t = model.ExtractPointCloud(3.f, -1);
+            final_mesh_t = model.ExtractTriangleMesh(3.f, -1);
+        }
+
         auto final_pcd =
                 std::make_shared<geometry::PointCloud>(final_pcd_t.ToLegacy());
         ClampPointColors(*final_pcd);
         state.SetPointCloud(final_pcd);
         io::WritePointCloud("scene.ply", *final_pcd);
-        utility::LogInfo("Saved scene.ply ({} points).", final_pcd->points_.size());
+        utility::LogInfo("Saved scene.ply ({} points, unfrozen).",
+                         final_pcd->points_.size());
 
-        auto final_mesh_t = model.ExtractTriangleMesh(3.f, -1);
         auto final_mesh =
                 std::make_shared<geometry::TriangleMesh>(final_mesh_t.ToLegacy());
         ClampVertexColors(*final_mesh);
         io::WriteTriangleMesh("scene_mesh.ply", *final_mesh);
-        utility::LogInfo("Saved scene_mesh.ply ({} vertices).",
+        utility::LogInfo("Saved scene_mesh.ply ({} vertices, unfrozen).",
                          final_mesh->vertices_.size());
     } catch (const std::exception& e) {
         utility::LogError("Failed to extract/save scene: {}", e.what());
@@ -576,9 +700,10 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
     utility::LogInfo(
             "Saved scene.ply, scene_mesh.ply, trajectory.log "
             "({} SLAM frames, {} integrated ({:.1f}%), {} strong poses, {} "
-            "f2f bridges).",
+            "f2f bridges, {} frozen objects).",
             frame_id, integrated_frames, integrate_ratio,
-            trajectory->parameters_.size(), f2f_bridge_successes);
+            trajectory->parameters_.size(), f2f_bridge_successes,
+            mesh_freeze.FrozenCount());
     if (integrate_ratio < 50.0 && frame_id > 30) {
         utility::LogWarning(
                 "Less than half of frames were integrated. Rescan slowly with "
@@ -671,14 +796,46 @@ int main(int argc, char* argv[]) {
                 argc, argv, "--estimated_points", params.estimated_points);
     }
 
+    FreezeParams freeze_params;
+    if (utility::ProgramOptionExists(argc, argv, "--no-auto_freeze")) {
+        freeze_params.auto_freeze = false;
+    } else if (utility::ProgramOptionExists(argc, argv, "--auto_freeze")) {
+        freeze_params.auto_freeze = true;
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--freeze_interval")) {
+        freeze_params.freeze_interval = utility::GetProgramOptionAsInt(
+                argc, argv, "--freeze_interval", freeze_params.freeze_interval);
+    }
+    freeze_params.config.output_dir =
+            utility::GetProgramOptionAsString(argc, argv, "--objects_dir",
+                                              "objects");
+    freeze_params.config.enabled = freeze_params.auto_freeze;
+    freeze_params.config.auto_save = true;
+    freeze_params.config.save_point_cloud_snapshot = true;
+    freeze_params.config.segmentation.voxel_size = params.voxel_size;
+    freeze_params.config.segmentation.trunc_multiplier = params.trunc_multiplier;
+    freeze_params.config.segmentation.dbscan_eps = params.voxel_size * 2.0;
+    freeze_params.config.segmentation.auto_freeze = freeze_params.auto_freeze;
+    if (utility::ProgramOptionExists(argc, argv, "--min_cluster_points")) {
+        freeze_params.config.segmentation.min_cluster_points =
+                utility::GetProgramOptionAsInt(argc, argv,
+                                               "--min_cluster_points", 5000);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--stability_frames")) {
+        freeze_params.config.segmentation.stability_frames =
+                utility::GetProgramOptionAsInt(argc, argv, "--stability_frames",
+                                               5);
+    }
+
     const std::string device_code =
             utility::GetProgramOptionAsString(argc, argv, "--device", "CUDA:0");
     const core::Device device(device_code);
     utility::LogInfo("Compute device: {}", device.ToString());
     utility::LogInfo("SLAM profile: {} (voxel {:.4f} m, depth_max {:.1f} m, "
-                     "blocks {}, est. points {})",
+                     "blocks {}, est. points {}, auto_freeze {})",
                      profile, params.voxel_size, params.depth_max,
-                     params.block_count, params.estimated_points);
+                     params.block_count, params.estimated_points,
+                     freeze_params.auto_freeze ? "on" : "off");
 
     tio::RealSenseSensor rs;
     tio::RSBagReader bag_reader;
@@ -734,7 +891,7 @@ int main(int argc, char* argv[]) {
 
     SharedState shared;
     std::thread slam_thread(SlamWorker, capture_frame, intrinsic, cam_intrinsic,
-                            device, params, std::ref(shared));
+                            device, params, freeze_params, std::ref(shared));
 
     RealTimeVisualizer vis;
     if (!vis.CreateVisualizerWindow("RealTimeSLAMRealSense", 1280, 720)) {
@@ -754,6 +911,7 @@ int main(int argc, char* argv[]) {
 
     bool geometry_added = false;
     std::shared_ptr<geometry::PointCloud> render_pcd;
+    std::vector<std::shared_ptr<geometry::TriangleMesh>> frozen_meshes;
     std::string last_window_status;
 
     vis.RegisterKeyCallback(
@@ -763,6 +921,14 @@ int main(int argc, char* argv[]) {
             });
 
     while (!shared.request_stop.load() && !shared.slam_finished.load()) {
+        std::vector<std::shared_ptr<geometry::TriangleMesh>> new_meshes;
+        if (shared.TakeNewFrozenMeshes(new_meshes)) {
+            for (auto& mesh : new_meshes) {
+                vis.AddGeometry(mesh);
+                frozen_meshes.push_back(mesh);
+            }
+        }
+
         std::shared_ptr<geometry::PointCloud> updated;
         if (shared.TakeUpdate(updated) && updated && !updated->IsEmpty()) {
             if (!geometry_added) {
