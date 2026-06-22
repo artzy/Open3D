@@ -260,7 +260,7 @@ geometry::RGBDImage RealSenseSensor::CaptureFrame(bool wait,
     }
     try {
         rs2::frameset frames;
-        if (!((wait && pipe_->try_wait_for_frames(&frames)) ||
+        if (!((wait && pipe_->try_wait_for_frames(&frames, 15000)) ||
               (!wait && pipe_->poll_for_frames(&frames))))
             return geometry::RGBDImage();
         if (align_depth_to_color) frames = align_to_color_->process(frames);
@@ -279,8 +279,9 @@ geometry::RGBDImage RealSenseSensor::CaptureFrame(bool wait,
                 metadata_.depth_dt_);
         return current_frame_;
     } catch (const rs2::error& e) {
-        utility::LogError("CaptureFrame() failed: {}: {}",
-                          rs2_exception_type_to_string(e.get_type()), e.what());
+        utility::LogWarning("CaptureFrame() failed: {}: {}",
+                            rs2_exception_type_to_string(e.get_type()),
+                            e.what());
         return geometry::RGBDImage();
     }
 }
