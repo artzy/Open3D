@@ -38,6 +38,9 @@ ReconstructionWindow (OnlineSLAMUtil.h)  →  Track + Integrate + GUI
 | `--record` | 실행 중 bag 파일로 녹화 |
 | `--use_bag_file` | bag 파일에서 RGB-D 재생 (경로 지정) |
 | `--device` | 연산 디바이스 (기본값 `CUDA:0`) |
+| `--profile` | SLAM 메모리 프로필: `low` / `medium`(기본) / `high` |
+| `--perf` | SLAM 속도 프로필: `fast`(기본) / `balanced` / `quality` |
+| `--no-align` | 라이브 캡처 시 depth-to-color 정렬 생략 (~33ms/frame 절약) |
 
 ### 4. 입력 소스 분기
 
@@ -86,11 +89,12 @@ app.Run();
    - `TrackFrameToModel()` — 이전 모델 대비 RGB-D 오도메트리(포즈 추정)
    - `Integrate()` — TSDF 볼륨에 깊이 통합
    - `SynthesizeModelFrame()` — 모델에서 raycast (가상 컬러/깊이)
-   - `ExtractPointCloud()` — 주기적으로 표면 포인트 추출
+   - `ExtractPointCloudExcludingFrozen()` — 주기적으로 frozen 블록 제외 partial extract
+   - **SegmentationWorker** — DBSCAN·기하 분류·안정성 추적 후 mesh freeze
 3. **GUI**
    - 좌측: 파라미터 슬라이더, 입력/raycast 이미지 탭, Info 탭
-   - 우측: 3D 뷰 (포인트 클라우드, 카메라 frustum, 궤적)
-4. **창 닫을 때** `scene.ply`(재구성), `trajectory.log`(카메라 궤적) 저장
+   - 우측: 3D 뷰 (live point cloud, frozen object mesh, 카메라 frustum, 궤적)
+4. **창 닫을 때** `scene.ply`(잔여 point cloud), `objects/`(frozen mesh + block keys), `trajectory.log` 저장
 
 ### SLAM 파라미터 예시
 
@@ -106,6 +110,12 @@ app.Run();
 | `update_interval` | 3D 표면 갱신 주기 (프레임 수) |
 | `update_surface` | 표면 업데이트 on/off |
 | `raycast_color` | raycast 컬러 이미지 사용 |
+| `auto_freeze` | 안정 클러스터 자동 mesh freeze (기본 on) |
+| `stability_frames` | freeze 전 연속 안정 extract 횟수 (기본 5) |
+| `dbscan_eps_multiplier` | DBSCAN eps = multiplier × voxel_size (기본 2.0) |
+| `min_cluster_points` | freeze 대상 최소 클러스터 점 수 (기본 5000) |
+
+자세한 freeze 동작: [Analysis/object-mesh-freeze.md](../Analysis/object-mesh-freeze.md)
 
 ## CUDA와의 관계
 
@@ -123,14 +133,39 @@ CUDA 빌드(`BUILD_CUDA_MODULE=ON`)가 필요합니다. CPU만 쓰려면 `--devi
 
 RTX 3060 등 Ampere GPU는 compute capability **8.6** (`CMAKE_CUDA_ARCHITECTURES=86`).
 
+## 메모리 프로필 (`--profile`)
+
+RTX 3060 12GB 기준. TSDF VRAM은 블록당 ~48 KB.
+
+| 프로필 | block_count | estimated_points | depth_max | TSDF VRAM (추정) |
+|--------|-------------|------------------|-----------|------------------|
+| `low` | 16,384 | 1.5M | 2.0 m | ~0.8 GB |
+| `medium` (기본) | 40,000 | 6M | 3.0 m | ~1.9 GB |
+| `high` | 50,000 | 8M | 5.0 m | ~2.4 GB |
+
+RealSense 저해상도 캡처: `examples/test_data/rs_slam_lowmem.json` (540p/480p, 30fps).
+
+## Performance preset (`--perf`)
+
+`--profile`(VRAM)과 독립. 기본값 **fast**.
+
+| preset | odom iter | GUI interval | raycast color |
+|--------|-----------|--------------|---------------|
+| `fast` (기본) | 3/2/1 | 3 | off |
+| `balanced` | 4/2/1 | 2 | on |
+| `quality` | 6/3/1 | 1 | on |
+
+자세한 튜닝: [Analysis/slam-performance.md](../Analysis/slam-performance.md), [Analysis/realsense-vram-optimization.md](../Analysis/realsense-vram-optimization.md)
+
 ## 실행 예시
 
 ```bat
-OnlineSLAMRealSense.exe --device CUDA:0
+OnlineSLAMRealSense.exe --device CUDA:0 --profile medium --perf fast
+# GUI: Auto freeze on, Stability frames 5 — frozen object 증가 시 Live surface points 감소 확인
 OnlineSLAMRealSense.exe -l
-OnlineSLAMRealSense.exe --use_bag_file record.bag
+OnlineSLAMRealSense.exe --use_bag_file record.bag --profile low --perf quality
+OnlineSLAMRealSense.exe --perf fast -c examples\test_data\rs_slam_lowmem.json --no-align
 OnlineSLAMRealSense.exe --align --record out.bag
-OnlineSLAMRealSense.exe -c rs-config.json
 ```
 
 배치 파일 예 (`build/bin/examples/Release/OnlineSLAMRealSense.bat`):
