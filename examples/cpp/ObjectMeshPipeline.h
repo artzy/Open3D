@@ -107,8 +107,8 @@ struct SegmentationConfig {
     // Architectural surface filter: only large / height-consistent patches
     // become plane surfaces; furniture-sized patches (sofa seats, table
     // tops, backrests) stay in the object path and keep their real shape.
-    double min_wall_height = 0.8;      // min vertical extent of a wall (m)
-    double min_patch_area_m2 = 1.5;    // alt. acceptance by patch area
+    double min_wall_height = 1.2;      // min vertical extent of a wall (m)
+    double min_patch_area_m2 = 1.5;    // min area for floor/ceiling seeds
     double floor_band = 0.15;          // height band around floor/ceiling (m)
 };
 
@@ -489,6 +489,34 @@ private:
 /// accurate than the OBB rectangle, which overestimates sparse patches.
 inline double EstimateSurfaceArea(size_t point_count, float voxel_size) {
     return static_cast<double>(point_count) * voxel_size * voxel_size;
+}
+
+/// World-frame vertical span (y points down, so max_y - min_y is physical
+/// height). More reliable than OBB projection for furniture vs. wall sizing.
+inline double ComputeWorldYSpan(const geometry::PointCloud& cloud) {
+    if (cloud.points_.empty()) {
+        return 0.0;
+    }
+    double min_y = cloud.points_[0].y();
+    double max_y = min_y;
+    for (const auto& point : cloud.points_) {
+        min_y = std::min(min_y, point.y());
+        max_y = std::max(max_y, point.y());
+    }
+    return max_y - min_y;
+}
+
+/// True when a vertical patch/cluster is wall-sized, not furniture-sized.
+/// Height is mandatory: dense sofa sides can exceed the area threshold without
+/// reaching architectural height, so area alone must never promote a wall.
+inline bool PassesArchitecturalWallFilter(double y_span,
+                                          double patch_area,
+                                          const SegmentationConfig& config) {
+    if (y_span < config.min_wall_height) {
+        return false;
+    }
+    constexpr double kMinWallAreaFraction = 0.25;
+    return patch_area >= config.min_patch_area_m2 * kMinWallAreaFraction;
 }
 
 /// Canonical in-plane axes derived only from the normal and anchored to the
@@ -1286,13 +1314,14 @@ inline std::vector<RegionCandidate> PartitionPlanarTiles(
         const double patch_area =
                 EstimateSurfaceArea(member_indices.size(), config.voxel_size);
         if (type == ObjectType::kWall) {
-            // Vertical extent of the patch box along world y.
-            const double y_extent =
-                    std::abs(patch->R_.col(0).y()) * patch->extent_(0) +
-                    std::abs(patch->R_.col(1).y()) * patch->extent_(1);
-            if (y_extent < config.min_wall_height &&
-                patch_area < config.min_patch_area_m2) {
-                continue;  // backrest-sized: leave to the object path
+            geometry::PointCloud patch_points;
+            patch_points.points_.reserve(member_indices.size());
+            for (size_t idx : member_indices) {
+                patch_points.points_.push_back(legacy.points_[idx]);
+            }
+            const double y_span = ComputeWorldYSpan(patch_points);
+            if (!PassesArchitecturalWallFilter(y_span, patch_area, config)) {
+                continue;  // furniture panel: leave to the object path
             }
         } else if (type == ObjectType::kFloor) {
             // Furniture tops sit above the floor (smaller y with y down).
@@ -1449,27 +1478,19 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
             RegionCandidate candidate;
             candidate.type = ClassifyCluster(cluster);
             if (candidate.type == ObjectType::kWall) {
-                // The architectural filter only guards the patch path, so a
-                // wall-like cluster must pass the same size gate before it
-                // may join the plane atlas; otherwise (e.g. a sofa backrest)
-                // it is demoted to a generic object and keeps its scanned
-                // shape via the marching-cubes mesh.
+                // Same architectural gate as the patch path: height is
+                // mandatory so dense furniture panels (sofa sides/backrests)
+                // cannot bypass via inflated point-count area alone.
                 geometry::PointCloud cluster_legacy = cluster.ToLegacy();
                 auto obb = cluster_legacy.GetOrientedBoundingBox();
                 Eigen::Vector3d extent = obb.extent_;
                 const int thin_axis = static_cast<int>(std::distance(
                         extent.data(),
                         std::min_element(extent.data(), extent.data() + 3)));
-                double y_extent = 0.0;
-                for (int k = 0; k < 3; ++k) {
-                    if (k != thin_axis) {
-                        y_extent += std::abs(obb.R_.col(k).y()) * extent(k);
-                    }
-                }
+                const double y_span = ComputeWorldYSpan(cluster_legacy);
                 const double area = EstimateSurfaceArea(
                         cluster_legacy.points_.size(), config.voxel_size);
-                if (y_extent >= config.min_wall_height ||
-                    area >= config.min_patch_area_m2) {
+                if (PassesArchitecturalWallFilter(y_span, area, config)) {
                     const Eigen::Vector3d n =
                             obb.R_.col(thin_axis).normalized();
                     candidate.plane << n(0), n(1), n(2), -n.dot(obb.center_);

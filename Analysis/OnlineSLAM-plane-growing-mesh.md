@@ -74,8 +74,9 @@ surface)** 을 freeze한 뒤 인접 평면을 연결해 메시를 키워가며 �
 - **수평 패치**: 기존 바닥/천장 높이 밴드(`floor_band` 0.15 m) 안에 있을 때만
   floor/ceiling. 힌트가 없으면 `min_patch_area_m2`(1.5 m²) 이상의 큰 패치만
   시드 가능. 소파 시트·테이블 상판은 거부.
-- **수직 패치**: y extent ≥ `min_wall_height`(0.8 m) 또는 면적 ≥ 1.5 m²일
-  때만 wall. 등받이 크기는 거부.
+- **수직 패치**: 실제 점 y span ≥ `min_wall_height`(1.2 m) **필수**.
+  면적은 보조(≥ 0.25 × min_patch_area_m2)이며, 면적 단독으로 wall 승격
+  불가 — 소파 옆면처럼 점 밀도만 큰 가구 패널을 차단.
 - 거부된 패치의 점은 claim되지 않고 DBSCAN 객체 경로로 흘러간다.
 
 ### 객체는 실제 형상 유지
@@ -85,11 +86,10 @@ box/cylinder로 분류된 클러스터도 primitive 대신 **TSDF marching cubes
 형상 그대로 freeze된다. 타입 라벨은 GUI/JSON에 유지.
 
 건축 필터는 DBSCAN 경로에도 적용된다: `ClassifyCluster`가 kWall로 재분류한
-클러스터(소파 등받이 등)는 동일한 크기 게이트(y extent ≥ min_wall_height
-또는 실측 면적 ≥ min_patch_area_m2)를 통과해야 평면 atlas로 가고, 탈락하면
-kGeneric으로 강등되어 실제 형상으로 freeze된다. 면적 판정은 OBB 사각형
-대신 **실측 추정**(점 개수 x voxel_size², `EstimateSurfaceArea`)을 사용해
-희박한 패치의 과대평가를 제거했다.
+클러스터(소파 옆면·등받이 등)는 `PassesArchitecturalWallFilter`(y span
+필수 + 보조 면적)를 통과해야 평면 atlas로 가고, 탈락하면 kGeneric으로
+강등되어 실제 형상으로 freeze된다. y span은 `ComputeWorldYSpan`(점 범위),
+면적은 `EstimateSurfaceArea`(점수 × voxel_size²)를 사용한다.
 
 ### 섬 영역 미평면화 해소 (frozen 블록 겹침 함정)
 
@@ -156,6 +156,6 @@ kGeneric으로 강등되어 실제 형상으로 freeze된다. 면적 판정은 O
 | `surface_merge_dist` | 0.02 m | coplanar 병합 offset 허용 |
 | `snap_angle_deg` | 30.0 | 연결 대상 최소 평면 사이각 |
 | `snap_dist_factor` | 1.5 | 스냅 거리 = factor x cell_size |
-| `min_wall_height` | 0.8 m | wall 승격 최소 수직 extent |
-| `min_patch_area_m2` | 1.5 m² | 크기 기준 대체 승격 조건 |
+| `min_wall_height` | 1.2 m | wall 승격 최소 y span (필수) |
+| `min_patch_area_m2` | 1.5 m² | floor/ceiling 시드 + wall 보조 면적 |
 | `floor_band` | 0.15 m | 바닥/천장 높이 허용 밴드 |
