@@ -1,0 +1,107 @@
+# 평면 우선 Freeze와 성장형 메시 연결
+
+Freeze 시 처음부터 폐곡면(얇은 박스)을 만들지 않고, 1차로 **평면(open
+surface)** 을 freeze한 뒤 인접 평면을 연결해 메시를 키워가며 폐곡면에
+점진적으로 접근하는 방식.
+
+대상: `OnlineSLAMRGBD`, `OnlineSLAMRealSense`, `RealTimeSLAMRealSense`
+(공통 파이프라인 `examples/cpp/ObjectMeshPipeline.h`).
+
+## 배경
+
+기존 구현은 평면 타일도 `CreateWallMesh`로 얇은 **박스(닫힌 폐곡면)** 를
+타일마다 생성했다. Lounge 150초 기준 박스 32개가 따로 떠 있고, 서로 이어지지
+않으며, 성장하지도 않았다.
+
+## 방법 조사와 채택
+
+| 방법 | 평가 |
+|------|------|
+| **점유 그리드 quad 메시 + 교선 스냅 (채택)** | 평면별 2D 셀 점유에서 셀당 quad 생성. 셀 추가만으로 메시가 자람. 이웃 평면과는 평면-평면 교선에 경계 정점을 스냅해 모서리 봉합. 온라인·저비용 |
+| 2D concave hull (alpha shape) | 경계는 매끈하나 점 추가마다 전체 재계산, 병합 복잡 |
+| PolyFit (Nan & Wonka 2017) | 평면 배열 + 정수계획법으로 완전 watertight. 전역 최적화라 온라인 성장 부적합 — **스캔 종료 후 후처리 후보** |
+| Kinetic Shape Reconstruction | 대규모 실내에 강력하나 신규 의존성/구현 규모 초과 — 문서화만 |
+| Poisson + 평면 투영 | 폐곡면은 얻지만 평면 선명도 저하, TSDF와 중복 |
+
+## 구현 (`ObjectMeshPipeline.h`)
+
+### 1단계: 평면 freeze = open quad 메시 (`PlaneSurfaceAtlas`)
+
+- 타일이 freeze되면 점들을 평면에 투영해 **0.25 m 셀 점유 그리드**(tile_size/4)에
+  누적 (평균 색 저장). 평면에서 `1.5 x surface_merge_dist`(3 cm) 이상 떨어진
+  점은 다른 기하로 간주해 제외.
+- **셀 커버리지 제약**: 셀은 기대 밀도(복셀당 1점 기준, 0.25 m 셀 ≈ 1800점)의
+  `min_cell_coverage`(기본 20%) 이상 관측 포인트가 쌓여야 렌더링됨 —
+  **확인된 클라우드 포인트가 있는 영역 안에서만 평면이 형성**되고, 산발적
+  노이즈로 셀이 커지지 않는다. (`min_cell_points`=10은 절대 하한)
+- 메시 = 점유 셀당 quad(삼각형 2개), 인접 셀과 정점 공유 → **납작한 open
+  메시**. `CreatePrimitiveMesh`의 평면 타입 박스 생성은 제거.
+- 셀 좌표는 법선에서 유도한 정준(canonical) 평면 축으로 계산해 프레임 간
+  재현 가능.
+
+### 2단계: 동일 평면 병합 (성장)
+
+- 새 타일이 기존 표면과 coplanar(법선 5° 이내, |Δd| ≤ 2 cm, 타입 동일)이면
+  그 표면에 셀 병합 — 표면 개수는 유지되고 메시가 자란다.
+- 평면 계수는 샘플 수 가중 평균으로 정련 (드리프트 억제). 셀 축은 생성 시
+  고정해 셀 인덱스가 흔들리지 않음.
+- 같은 id로 재방출된 메시는 소비자가 **교체**: OnlineSLAM은 `frozen_objects_`
+  entry 교체 + 씬 `region_{id}` remove-then-add, RealTime은 id→mesh 맵으로
+  `UpdateGeometry`.
+
+### 3단계: 인접 평면 연결 (corner snap)
+
+- 이웃 후보: 법선 사이 각 > 30°(coplanar 제외) + AABB가 스냅 거리(1.5 x cell)
+  내 접근.
+- 두 평면의 **교선**을 `[n1; n2; dir]` 3x3 시스템으로 풀고, 경계 정점(한
+  셀에만 속한 격자 변의 정점) 중 교선까지 거리 ≤ 스냅 거리인 것을 교선 위로
+  투영 — 벽-벽, 벽-바닥 모서리가 틈 없이 봉합된다.
+- 성장으로 이웃 관계가 바뀔 수 있으므로 dirty 표면의 이웃도 함께 재생성.
+- **폐합도(closure)** = 스냅된 경계 정점 비율. Info 탭과 JSON에 표시.
+
+## GUI / 저장
+
+- Info 탭: `Surfaces (N): #id type area closure%` 목록 + frozen region 수
+- JSON `objects/frozen_blocks.json`: 기존 `objects` 배열 유지 + `surfaces`
+  배열 추가 `{id, type, plane, cell_size, cell_count, closure, connected}`
+- 평면 메시 파일명 `surface_{id}.ply` (성장 시 갱신), 객체는 `object_{id}.ply`
+
+## 테스트 (Lounge 150초, CUDA)
+
+### 1차 (2026-07-02, 커버리지 제약 전)
+
+- 표면 19개 (기존 박스 32개 대비 감소), 성장·연결 동작 확인
+- 주 바닥 177셀 — 산발적 포인트로도 셀이 켜져 실제 관측 영역보다 큼
+
+### 2차 (2026-07-03, 셀 커버리지 20% 적용)
+
+- 표면 **10개**, 주 바닥 **81셀**(5.1 m²), 주 벽 37셀 — 메시가 확인된
+  포인트 영역에 밀착
+- 성장/폐합 유지: 바닥 closure 57%, 벽 55~100%, connected 목록 정상
+- `surface_*.ply` 10개 + JSON `surfaces` 배열 정상
+- CPU 45초 sanity PASS (1차에서 확인, 셀 로직은 디바이스 무관)
+
+### 수동 테스트 (D415 실기)
+
+1. 방 스캔 시 바닥+벽 2~3면이 연결된 open shell로 성장하는지 확인
+2. Info 탭 closure %가 스캔 진행에 따라 오르는지 확인
+3. 모서리(벽-벽, 벽-바닥)에 틈이 없는지 시각 확인
+
+## 한계와 후속 후보
+
+- 이 방식은 폐곡면에 **근접**할 뿐 완전한 watertight는 아님 (문/창/미관측
+  영역은 열린 경계로 남음 — 의도된 동작).
+- 완전 폐합이 필요하면 스캔 종료 후 PolyFit류 후처리(표면 plane + 경계
+  입력)로 확장 가능 — 범위 외.
+- 곡면(원기둥 등)은 여전히 primitive 박스/실린더로 처리.
+
+## 조정 가능한 항목 (`SegmentationConfig`)
+
+| 항목 | 기본값 | 의미 |
+|------|--------|------|
+| `min_cell_points` | 10 | 셀 점유 절대 하한 점수 |
+| `min_cell_coverage` | 0.2 | 셀 렌더링에 필요한 기대 밀도 대비 커버리지 |
+| `surface_merge_angle_deg` | 5.0 | coplanar 병합 법선 허용각 |
+| `surface_merge_dist` | 0.02 m | coplanar 병합 offset 허용 |
+| `snap_angle_deg` | 30.0 | 연결 대상 최소 평면 사이각 |
+| `snap_dist_factor` | 1.5 | 스냅 거리 = factor x cell_size |

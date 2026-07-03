@@ -24,10 +24,12 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "open3d/Open3D.h"
 #include "IncrementalMeshFreeze.h"
@@ -276,8 +278,12 @@ public:
         return out != nullptr;
     }
 
+    // Meshes are keyed by region/surface id: a repeated id is a grown
+    // surface that must replace the previously displayed mesh.
     void AddFrozenMeshes(
-            const std::vector<std::shared_ptr<geometry::TriangleMesh>>& meshes) {
+            const std::vector<
+                    std::pair<int, std::shared_ptr<geometry::TriangleMesh>>>&
+                    meshes) {
         if (meshes.empty()) {
             return;
         }
@@ -288,7 +294,9 @@ public:
     }
 
     bool TakeNewFrozenMeshes(
-            std::vector<std::shared_ptr<geometry::TriangleMesh>>& out) {
+            std::vector<std::pair<int,
+                                  std::shared_ptr<geometry::TriangleMesh>>>&
+                    out) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!has_mesh_update_) {
             return false;
@@ -326,7 +334,8 @@ private:
     mutable std::mutex mutex_;
     std::shared_ptr<geometry::PointCloud> display_pcd_;
     bool has_update_ = false;
-    std::vector<std::shared_ptr<geometry::TriangleMesh>> pending_meshes_;
+    std::vector<std::pair<int, std::shared_ptr<geometry::TriangleMesh>>>
+            pending_meshes_;
     bool has_mesh_update_ = false;
     int frozen_count_ = 0;
     std::string status_;
@@ -601,11 +610,13 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                     auto new_frozen = mesh_freeze.ProcessSurface(
                             pcd_t.To(core::Device("CPU:0")), model);
                     if (!new_frozen.empty()) {
-                        std::vector<std::shared_ptr<geometry::TriangleMesh>>
+                        std::vector<std::pair<
+                                int, std::shared_ptr<geometry::TriangleMesh>>>
                                 mesh_ptrs;
                         mesh_ptrs.reserve(new_frozen.size());
                         for (const auto& entry : new_frozen) {
-                            mesh_ptrs.push_back(
+                            mesh_ptrs.emplace_back(
+                                    entry.id,
                                     std::make_shared<geometry::TriangleMesh>(
                                             entry.mesh_legacy));
                         }
@@ -911,7 +922,9 @@ int main(int argc, char* argv[]) {
 
     bool geometry_added = false;
     std::shared_ptr<geometry::PointCloud> render_pcd;
-    std::vector<std::shared_ptr<geometry::TriangleMesh>> frozen_meshes;
+    // Displayed frozen meshes by region/surface id; growing surfaces update
+    // the registered mesh in place instead of adding a duplicate.
+    std::map<int, std::shared_ptr<geometry::TriangleMesh>> frozen_meshes;
     std::string last_window_status;
 
     vis.RegisterKeyCallback(
@@ -921,11 +934,20 @@ int main(int argc, char* argv[]) {
             });
 
     while (!shared.request_stop.load() && !shared.slam_finished.load()) {
-        std::vector<std::shared_ptr<geometry::TriangleMesh>> new_meshes;
+        std::vector<std::pair<int, std::shared_ptr<geometry::TriangleMesh>>>
+                new_meshes;
         if (shared.TakeNewFrozenMeshes(new_meshes)) {
-            for (auto& mesh : new_meshes) {
-                vis.AddGeometry(mesh);
-                frozen_meshes.push_back(mesh);
+            for (auto& [id, mesh] : new_meshes) {
+                auto it = frozen_meshes.find(id);
+                if (it == frozen_meshes.end()) {
+                    vis.AddGeometry(mesh, false);
+                    frozen_meshes[id] = mesh;
+                } else {
+                    // Visualizer matches geometry by pointer: copy the grown
+                    // mesh into the registered object and refresh it.
+                    *it->second = *mesh;
+                    vis.UpdateGeometry(it->second);
+                }
             }
         }
 
@@ -935,6 +957,12 @@ int main(int argc, char* argv[]) {
                 render_pcd = updated;
                 vis.AddGeometry(render_pcd);
                 vis.ResetViewPoint(true);
+                // World frame equals the first camera frame (y points DOWN),
+                // so the default view shows the room upside down. Enforce an
+                // upright view from the initial camera side.
+                auto& view = vis.GetViewControl();
+                view.SetUp(Eigen::Vector3d(0.0, -1.0, 0.0));
+                view.SetFront(Eigen::Vector3d(0.0, 0.0, -1.0));
                 geometry_added = true;
             } else {
                 // Visualizer matches geometry by pointer; reuse render_pcd and

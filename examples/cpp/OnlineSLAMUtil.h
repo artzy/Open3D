@@ -11,14 +11,17 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
 
 #include "open3d/Open3D.h"
+#include "open3d/core/TensorFunction.h"
 #include "ObjectMeshPipeline.h"
 
 namespace open3d {
@@ -29,12 +32,42 @@ using namespace open3d::visualization;
 // Filament upload budget for live preview (extract uses estimated_points).
 static constexpr int kMaxRenderPoints = 500000;
 
-// Tracking tiers: strict pose update vs weak integrate-only vs reject outlier jumps.
-static constexpr double kPoseFitnessMin = 0.15;
-static constexpr double kPoseTranslationMax = 0.12;
+// Tracking tiers: only Strong frames (good fitness, small per-frame motion)
+// update the pose and integrate. Weak / failed / outlier frames are skipped
+// entirely: integrating with an uncertain pose stamps duplicate copies of
+// the scene ("ghost walls").
+static constexpr double kPoseFitnessMin = 0.25;      // Min fitness slider default
+static constexpr double kPoseTranslationMax = 0.12;  // m per frame
+static constexpr double kPoseRotationMaxDeg = 8.0;   // deg per frame
 static constexpr double kWeakFitnessMin = 0.08;
 static constexpr double kWeakTranslationMax = 0.30;
 static constexpr double kOutlierTranslation = 0.50;
+static constexpr double kOutlierRotationDeg = 25.0;
+
+// Relocalization gate: after this many consecutive non-Strong frames the
+// pose is likely drifted, so integration is paused until the camera re-locks
+// onto the model with several consecutive Strong frames. This prevents a
+// drifted pose from integrating a shifted duplicate of already-scanned walls.
+static constexpr int kRelocalizeAfterFailures = 3;
+static constexpr int kRelocalizeStrongFrames = 5;
+
+// Free-space carving: voxels that a trusted frame observes well in front of
+// the measured surface are ghost candidates; halving their weight every pass
+// erases mis-integrated geometry once the area is rescanned correctly.
+// A pass costs ~60-130 ms (CUDA, medium profile), so it runs sparsely; real
+// surfaces are re-integrated (+1 weight/frame) between passes and keep a
+// stable equilibrium well above the extraction weight threshold.
+static constexpr int kCarveIntervalCuda = 30;  // frames between carve passes
+static constexpr int kCarveIntervalCpu = 90;
+static constexpr float kCarveMarginTruncFactor = 3.0f;  // margin/sdf_trunc
+
+// Stationary gate: when the camera has not moved for this many consecutive
+// frames, Integrate/carving are skipped (tracking and GUI stay live). By
+// then voxel weights are well above the extraction threshold, so further
+// integration only burns GPU time and lets edge noise allocate new blocks.
+static constexpr double kStationaryTranslationMax = 0.005;  // m per frame
+static constexpr double kStationaryRotationMaxDeg = 0.3;    // deg per frame
+static constexpr int kStationaryFrames = 30;
 
 // OdometryLossParams uses depth_huber_delta=0.05 by default; truncation must
 // be strictly greater to avoid Huber/L2 degeneracy warnings.
@@ -308,6 +341,8 @@ public:
                 {"update_interval", 50},
                 {"depth_max", 3.0},
                 {"depth_diff", 0.07},
+                {"min_fitness", kPoseFitnessMin},
+                {"min_weight", 3.0},
                 {"odometry_iter_0", 6},
                 {"odometry_iter_1", 3},
                 {"odometry_iter_2", 1},
@@ -316,7 +351,9 @@ public:
                 {"auto_freeze", 1},
                 {"stability_frames", 5},
                 {"dbscan_eps_multiplier", 2.0},
-                {"min_cluster_points", 5000}};
+                {"min_cluster_points", 5000},
+                {"planar_tiles", 1},
+                {"tile_size", 1.0}};
         /// Override values by user provided default parameters
         for (auto it : default_parameters_) {
             if (default_param.find(it.first) != default_param.end()) {
@@ -384,6 +421,18 @@ public:
                 default_param.at("depth_diff"), 0.06, 0.5,
                 "Depth truncation for tracking outlier rejection. Must be "
                 "> 0.05 (internal Huber delta). Default 0.07.");
+        adjustable_props_->AddFloatSlider(
+                "Min fitness", &prop_values_.min_fitness,
+                default_param.at("min_fitness"), 0.10, 0.50,
+                "Minimum odometry fitness to accept a frame for integration. "
+                "Higher values reject uncertain poses (fewer ghost walls) at "
+                "the cost of skipping more frames. Default 0.25.");
+        adjustable_props_->AddFloatSlider(
+                "Min weight", &prop_values_.min_weight,
+                default_param.at("min_weight"), 1.0, 10.0,
+                "TSDF weight threshold used by 'Clean ghosts' and by the "
+                "final scene.ply export. Voxels observed fewer times than "
+                "this are treated as unreliable. Default 3.");
         adjustable_props_->AddBool("Update surface",
                                    &prop_values_.update_surface, true,
                                    "Update surface every several frames, "
@@ -409,6 +458,16 @@ public:
                 static_cast<int>(default_param.at("min_cluster_points")), 500,
                 50000,
                 "Ignore clusters smaller than this point count.");
+        adjustable_props_->AddBool(
+                "Planar tiles", &prop_values_.planar_tiles,
+                default_param.at("planar_tiles") > 0.5,
+                "Partition walls/floors into planar patches subdivided into "
+                "tiles so large surfaces freeze incrementally.");
+        adjustable_props_->AddFloatSlider(
+                "Tile size", &prop_values_.tile_size,
+                default_param.at("tile_size"), 0.5, 2.0,
+                "Edge length (m) of plane-local tiles used to partition "
+                "large planar regions.");
 
         panel_->AddChild(std::make_shared<gui::Label>("Starting settings"));
         panel_->AddChild(fixed_props_);
@@ -422,12 +481,32 @@ public:
         b->SetOn(true);
         b->SetOnClicked([this](bool is_on) {
             if (is_on) {
-                StartSlam();
+                if (is_started_) {
+                    is_running_ = true;
+                    adjustable_props_->SetEnabled(true);
+                }
             } else {
                 PauseSlam();
             }
         });
         panel_->AddChild(b);
+        panel_->AddFixed(vspacing);
+
+        // Manually erase low-weight (ghost) voxels and reclaim empty blocks.
+        auto clean_button = std::make_shared<gui::Button>("Clean ghosts");
+        clean_button->SetOnClicked([this]() {
+            if (!is_started_ || !model_) {
+                return;
+            }
+            CleanLowWeightVoxels(
+                    static_cast<float>(prop_values_.min_weight.load()));
+            const int64_t hash_size = model_->GetHashMap().Size();
+            RequestAsyncExtract(
+                    3.0f, GetLiveExtractBudget(
+                                  prop_values_.estimated_points.load(),
+                                  hash_size));
+        });
+        panel_->AddChild(clean_button);
         panel_->AddFixed(vspacing);
 
         panel_->AddStretch();
@@ -473,8 +552,12 @@ public:
                 utility::LogInfo("Writing reconstruction to scene.ply...");
                 try {
                     const int save_budget = prop_values_.estimated_points.load();
+                    // Use the Min weight slider so low-confidence (ghost)
+                    // voxels are excluded from the exported model.
+                    const float save_weight = static_cast<float>(
+                            prop_values_.min_weight.load());
                     auto pcd = model_->ExtractPointCloudExcludingFrozen(
-                            3.0, save_budget);
+                            save_weight, save_budget);
                     auto pcd_legacy =
                             std::make_shared<geometry::PointCloud>(pcd.ToLegacy());
                     io::WritePointCloud("scene.ply", *pcd_legacy);
@@ -489,8 +572,13 @@ public:
                     blocks_json << "{\n  \"objects\": [\n";
                     for (size_t i = 0; i < frozen_objects_.size(); ++i) {
                         const auto& obj = frozen_objects_[i];
+                        // Growing plane surfaces are saved as surface_*.ply,
+                        // discrete objects keep the object_*.ply naming.
                         const std::string mesh_path =
-                                "object_" + std::to_string(obj.id) + ".ply";
+                                (object_mesh::IsPlanarType(obj.type)
+                                         ? "surface_"
+                                         : "object_") +
+                                std::to_string(obj.id) + ".ply";
                         try {
                             io::WriteTriangleMesh("objects/" + mesh_path,
                                                   obj.mesh.ToLegacy());
@@ -504,6 +592,16 @@ public:
                         blocks_json << "      \"type\": \""
                                     << object_mesh::ObjectTypeName(obj.type)
                                     << "\",\n";
+                        blocks_json << "      \"state\": \"frozen\",\n";
+                        if (object_mesh::IsPlanarType(obj.type)) {
+                            blocks_json << fmt::format(
+                                    "      \"plane\": [{:.6f}, {:.6f}, "
+                                    "{:.6f}, {:.6f}],\n",
+                                    obj.plane(0), obj.plane(1), obj.plane(2),
+                                    obj.plane(3));
+                        }
+                        blocks_json << fmt::format(
+                                "      \"area_m2\": {:.3f},\n", obj.area_m2);
                         blocks_json << "      \"mesh\": \"" << mesh_path
                                     << "\"";
                         if (obj.block_keys.NumElements() > 0) {
@@ -528,10 +626,37 @@ public:
                         }
                         blocks_json << "\n";
                     }
+                    blocks_json << "  ],\n  \"surfaces\": [\n";
+                    const auto surfaces = plane_atlas_.Snapshot();
+                    for (size_t i = 0; i < surfaces.size(); ++i) {
+                        const auto& s = surfaces[i];
+                        blocks_json << fmt::format(
+                                "    {{\"id\": {}, \"type\": \"{}\", "
+                                "\"plane\": [{:.6f}, {:.6f}, {:.6f}, "
+                                "{:.6f}], \"cell_size\": {:.3f}, "
+                                "\"cell_count\": {}, \"closure\": {:.3f}, "
+                                "\"connected\": [",
+                                s.id, object_mesh::ObjectTypeName(s.type),
+                                s.plane(0), s.plane(1), s.plane(2),
+                                s.plane(3), s.cell_size, s.cell_count,
+                                s.closure);
+                        for (size_t k = 0; k < s.connected.size(); ++k) {
+                            if (k > 0) {
+                                blocks_json << ", ";
+                            }
+                            blocks_json << s.connected[k];
+                        }
+                        blocks_json << "]}";
+                        if (i + 1 < surfaces.size()) {
+                            blocks_json << ",";
+                        }
+                        blocks_json << "\n";
+                    }
                     blocks_json << "  ]\n}\n";
                     utility::LogInfo(
-                            "Saved {} frozen object meshes to objects/.",
-                            frozen_objects_.size());
+                            "Saved {} frozen region meshes ({} surfaces) to "
+                            "objects/.",
+                            frozen_objects_.size(), surfaces.size());
                 }
 
                 utility::LogInfo("Writing trajectory to trajectory.log...");
@@ -540,12 +665,15 @@ public:
             }
             return true;  // false would cancel the close
         });
-        update_thread_ = std::thread([this]() { this->UpdateMain(); });
         extract_thread_ = std::thread([this]() { this->ExtractWorker(); });
         segmentation_thread_ =
                 std::thread([this]() { this->SegmentationWorker(); });
-        gui::Application::GetInstance().PostToMainThread(this, [this]() {
-            StartSlam();
+        SetOnTickEvent([this]() {
+            if (!slam_thread_started_.exchange(true)) {
+                update_thread_ = std::thread([this]() { this->UpdateMain(); });
+                StartSlam();
+            }
+            return false;
         });
     }
 
@@ -647,12 +775,16 @@ protected:
         std::atomic<double> trunc_multiplier;
         std::atomic<double> depth_max;
         std::atomic<double> depth_diff;
+        std::atomic<double> min_fitness;
+        std::atomic<double> min_weight;
         std::atomic<bool> raycast_color;
         std::atomic<bool> update_surface;
         std::atomic<bool> auto_freeze;
         std::atomic<int> stability_frames;
         std::atomic<double> dbscan_eps_multiplier;
         std::atomic<int> min_cluster_points;
+        std::atomic<bool> planar_tiles;
+        std::atomic<double> tile_size;
     } prop_values_;
 
     struct {
@@ -660,15 +792,21 @@ protected:
         t::geometry::PointCloud pcd;
         std::atomic<uint64_t> version{0};
     } surface_;
+    std::shared_ptr<geometry::PointCloud> display_points_legacy_;
     bool points_geometry_added_ = false;
     bool trajectory_geometry_added_ = false;
     int64_t last_render_point_count_ = 0;
     uint64_t last_surface_version_gui_ = 0;
     bool camera_fitted_ = false;
-    Eigen::Vector3f last_camera_center_ = Eigen::Vector3f::Zero();
     int consecutive_tracking_failures_ = 0;
+    // Relocalization gate state (SLAM thread only).
+    bool relocalizing_ = false;
+    int relocalize_strong_streak_ = 0;
+    // Stationary-integration gate state (SLAM thread only).
+    int stationary_frames_ = 0;
     int consecutive_slow_frames_ = 0;
     int capture_skip_count_ = 0;
+    std::atomic<bool> slam_thread_started_{false};
 
     std::shared_ptr<gui::ToggleSwitch> resume_toggle_;
 
@@ -677,6 +815,9 @@ protected:
     std::thread update_thread_;
     std::thread extract_thread_;
     std::mutex model_mutex_;
+    std::mutex gui_sync_mutex_;
+    std::condition_variable gui_sync_cv_;
+    std::atomic<int> pending_gui_posts_{0};
     std::mutex extract_mutex_;
     std::condition_variable extract_cv_;
     std::atomic<bool> extract_requested_{false};
@@ -688,13 +829,23 @@ protected:
         object_mesh::ObjectType type = object_mesh::ObjectType::kGeneric;
         t::geometry::TriangleMesh mesh;
         core::Tensor block_keys;
+        Eigen::Vector4d plane = Eigen::Vector4d::Zero();
+        int tile_i = 0;
+        int tile_j = 0;
+        double area_m2 = 0.0;
+        double cell_size = 0.0;
+        int cell_count = 0;
+        double closure = 0.0;
+        std::vector<int> connected;
     };
     std::vector<FrozenObjectEntry> frozen_objects_;
     std::mutex frozen_mutex_;
     std::atomic<uint64_t> frozen_version_{0};
     uint64_t last_frozen_version_gui_ = 0;
-    object_mesh::ObjectFreezeTracker freeze_tracker_{
-            object_mesh::SegmentationConfig{}};
+    // Region partitioning/indexing: block-key spatial index + state machine.
+    object_mesh::RegionRegistry region_registry_;
+    // Growing plane surfaces (open quad meshes, merged and corner-snapped).
+    object_mesh::PlaneSurfaceAtlas plane_atlas_;
     int next_object_id_ = 0;
 
     std::thread segmentation_thread_;
@@ -702,6 +853,22 @@ protected:
     std::condition_variable segmentation_cv_;
     std::atomic<bool> segmentation_requested_{false};
     t::geometry::PointCloud pending_segmentation_pcd_;
+
+    void WaitForPendingGui() {
+        std::unique_lock<std::mutex> lock(gui_sync_mutex_);
+        gui_sync_cv_.wait(lock, [this]() {
+            return pending_gui_posts_.load() == 0;
+        });
+    }
+
+    void PostGuiTask(std::function<void()> task) {
+        pending_gui_posts_.fetch_add(1);
+        gui::Application::GetInstance().PostToMainThread(this, [this, task]() {
+            task();
+            pending_gui_posts_.fetch_sub(1);
+            gui_sync_cv_.notify_all();
+        });
+    }
 
     std::vector<t::pipelines::odometry::OdometryConvergenceCriteria>
     BuildOdometryCriteria() {
@@ -720,6 +887,196 @@ protected:
         extract_cv_.notify_one();
     }
 
+    // Decay TSDF confidence of voxels that the current (trusted) frame
+    // observes as free space, i.e. well in front of the measured surface.
+    // The Integrate kernel ignores such observations (sdf < -sdf_trunc), so
+    // ghost walls stamped by a mis-tracked pose would otherwise stay forever.
+    // Halving the weight per pass makes ghosts drop below the extraction /
+    // raycast weight threshold within a few passes once the area is rescanned
+    // from a correct pose. Caller must hold model_mutex_.
+    void CarveFreeSpace(const core::Tensor& depth_tensor,
+                        const core::Tensor& T_frame_to_model,
+                        float depth_scale,
+                        float depth_max) {
+        auto& grid = model_->voxel_grid_;
+        core::HashMap hashmap = grid.GetHashMap();
+        core::Tensor active_indices = hashmap.GetActiveIndices();
+        if (active_indices.GetLength() == 0) {
+            return;
+        }
+
+        core::Tensor weight = grid.GetAttribute("weight");
+        const int64_t resolution = weight.GetShape()[1];
+        const float voxel_size =
+                static_cast<float>(prop_values_.voxel_size.load());
+        const float sdf_trunc =
+                voxel_size *
+                static_cast<float>(prop_values_.trunc_multiplier.load());
+        // Conservative margin: only voxels clearly in front of the observed
+        // surface are carved, so thin real structures are not eroded.
+        const float carve_margin = kCarveMarginTruncFactor * sdf_trunc;
+
+        core::Tensor K_cpu =
+                intrinsic_.To(core::Device("CPU:0"), core::Float64)
+                        .Contiguous();
+        const double* k_ptr = K_cpu.GetDataPtr<double>();
+        const float fx = static_cast<float>(k_ptr[0]);
+        const float fy = static_cast<float>(k_ptr[4]);
+        const float cx = static_cast<float>(k_ptr[2]);
+        const float cy = static_cast<float>(k_ptr[5]);
+        core::Tensor T_world_to_cam =
+                T_frame_to_model.Inverse().To(device_, core::Float32);
+        core::Tensor R_t = T_world_to_cam.Slice(0, 0, 3)
+                                   .Slice(1, 0, 3)
+                                   .T()
+                                   .Contiguous();
+        core::Tensor t_vec = T_world_to_cam.Slice(0, 0, 3)
+                                     .Slice(1, 3, 4)
+                                     .Contiguous()
+                                     .Reshape({1, 3});
+
+        const int64_t rows = depth_tensor.GetShape()[0];
+        const int64_t cols = depth_tensor.GetShape()[1];
+
+        // Block-level frustum prefilter (projected block centers, with a
+        // half-diagonal margin) keeps the per-voxel pass tractable.
+        const float block_size = voxel_size * static_cast<float>(resolution);
+        const float block_radius = 0.87f * block_size;
+        core::Tensor block_centers =
+                (hashmap.GetKeyTensor()
+                                 .IndexGet({active_indices.To(core::Int64)})
+                                 .To(core::Float32) +
+                 0.5f) *
+                block_size;
+        core::Tensor centers_cam = block_centers.Matmul(R_t) + t_vec;
+        core::Tensor xc = centers_cam.Slice(1, 0, 1).Contiguous().Reshape({-1});
+        core::Tensor yc = centers_cam.Slice(1, 1, 2).Contiguous().Reshape({-1});
+        core::Tensor zc = centers_cam.Slice(1, 2, 3).Contiguous().Reshape({-1});
+        core::Tensor uc = xc / zc * fx + cx;
+        core::Tensor vc = yc / zc * fy + cy;
+        core::Tensor margin_u = (fx * block_radius) / zc;
+        core::Tensor margin_v = (fy * block_radius) / zc;
+        core::Tensor in_frustum =
+                zc.Gt(0.05f)
+                        .LogicalAnd(zc.Lt(depth_max + block_radius))
+                        .LogicalAnd(uc.Ge(0.0f - margin_u))
+                        .LogicalAnd(uc.Lt(margin_u +
+                                          static_cast<float>(cols)))
+                        .LogicalAnd(vc.Ge(0.0f - margin_v))
+                        .LogicalAnd(vc.Lt(margin_v +
+                                          static_cast<float>(rows)));
+        core::Tensor frustum_indices = active_indices.IndexGet({in_frustum});
+        if (frustum_indices.GetLength() == 0) {
+            return;
+        }
+
+        // Per-voxel pass: project voxel centers into the depth image and
+        // compare against the measured depth.
+        core::Tensor voxel_coords, flat_indices;
+        std::tie(voxel_coords, flat_indices) =
+                grid.GetVoxelCoordinatesAndFlattenedIndices(frustum_indices);
+        core::Tensor cam = voxel_coords.Matmul(R_t) + t_vec;
+        core::Tensor x = cam.Slice(1, 0, 1).Contiguous().Reshape({-1});
+        core::Tensor y = cam.Slice(1, 1, 2).Contiguous().Reshape({-1});
+        core::Tensor z = cam.Slice(1, 2, 3).Contiguous().Reshape({-1});
+        core::Tensor ui = (x / z * fx + cx).Floor().To(core::Int64);
+        core::Tensor vi = (y / z * fy + cy).Floor().To(core::Int64);
+        core::Tensor valid = z.Gt(0.05f)
+                                     .LogicalAnd(ui.Ge(0))
+                                     .LogicalAnd(ui.Lt(cols))
+                                     .LogicalAnd(vi.Ge(0))
+                                     .LogicalAnd(vi.Lt(rows));
+        ui = ui.IndexGet({valid});
+        vi = vi.IndexGet({valid});
+        z = z.IndexGet({valid});
+        flat_indices = flat_indices.IndexGet({valid});
+        if (flat_indices.GetLength() == 0) {
+            return;
+        }
+
+        core::Tensor depth_flat =
+                depth_tensor.Reshape({rows * cols}).To(core::Float32) /
+                depth_scale;
+        core::Tensor d = depth_flat.IndexGet({vi * cols + ui});
+        core::Tensor carve_mask = d.Gt(0.0f)
+                                          .LogicalAnd(d.Le(depth_max))
+                                          .LogicalAnd((d - z).Gt(carve_margin));
+        core::Tensor carve_indices = flat_indices.IndexGet({carve_mask});
+        if (carve_indices.GetLength() == 0) {
+            return;
+        }
+
+        core::Tensor weight_flat = weight.View({weight.NumElements()});
+        core::Tensor w = weight_flat.IndexGet({carve_indices}).To(core::Int32);
+        // Only touch voxels that still carry weight (most free-space voxels
+        // in allocated blocks are already 0).
+        core::Tensor occupied = w.Gt(0);
+        carve_indices = carve_indices.IndexGet({occupied});
+        if (carve_indices.GetLength() == 0) {
+            return;
+        }
+        w = w.IndexGet({occupied});
+        weight_flat.IndexSet({carve_indices}, (w / 2).To(weight.GetDtype()));
+        utility::LogDebug("Free-space carving: decayed {} voxels.",
+                          carve_indices.GetLength());
+    }
+
+    // Reset all voxels whose weight is below \p min_weight (typical for ghost
+    // surfaces integrated only briefly with a bad pose) and erase blocks that
+    // become completely empty, reclaiming voxel hash capacity. Blocks are
+    // zeroed before Erase so a reused hash slot integrates from scratch.
+    void CleanLowWeightVoxels(float min_weight) {
+        std::lock_guard<std::mutex> lock(model_mutex_);
+        if (!model_) {
+            return;
+        }
+        auto& grid = model_->voxel_grid_;
+        core::HashMap hashmap = grid.GetHashMap();
+        core::Tensor buf_indices = hashmap.GetActiveIndices().To(core::Int64);
+        const int64_t num_blocks = buf_indices.GetLength();
+        if (num_blocks == 0) {
+            return;
+        }
+
+        core::Tensor weight = grid.GetAttribute("weight");
+        core::Tensor tsdf = grid.GetAttribute("tsdf");
+
+        // Chunked to bound temporary memory (a full 40k-block volume would
+        // need several hundred MB of masks at once).
+        constexpr int64_t kChunkBlocks = 8192;
+        std::vector<core::Tensor> empty_block_keys;
+        for (int64_t start = 0; start < num_blocks; start += kChunkBlocks) {
+            core::Tensor idx = buf_indices.Slice(
+                    0, start, std::min(start + kChunkBlocks, num_blocks));
+            core::Tensor w = weight.IndexGet({idx});
+            core::Tensor keep = w.Ge(min_weight);
+            weight.IndexSet({idx}, w * keep.To(weight.GetDtype()));
+            core::Tensor t = tsdf.IndexGet({idx});
+            tsdf.IndexSet({idx}, t * keep.To(tsdf.GetDtype()));
+
+            const int64_t m = idx.GetLength();
+            core::Tensor kept_per_block =
+                    keep.To(core::Int32).Reshape({m, -1}).Sum({1});
+            core::Tensor empty_idx =
+                    idx.IndexGet({kept_per_block.Eq(0)});
+            if (empty_idx.GetLength() > 0) {
+                empty_block_keys.push_back(
+                        hashmap.GetKeyTensor().IndexGet({empty_idx}));
+            }
+        }
+
+        int64_t erased = 0;
+        if (!empty_block_keys.empty()) {
+            core::Tensor keys = core::Concatenate(empty_block_keys, 0);
+            hashmap.Erase(keys);
+            erased = keys.GetLength();
+        }
+        utility::LogInfo(
+                "Clean ghosts: reset voxels with weight < {}, erased {} empty "
+                "blocks ({} -> {} active).",
+                min_weight, erased, num_blocks, hashmap.Size());
+    }
+
     object_mesh::SegmentationConfig BuildSegmentationConfig() const {
         object_mesh::SegmentationConfig config;
         config.auto_freeze = prop_values_.auto_freeze.load();
@@ -731,14 +1088,16 @@ protected:
                 static_cast<float>(prop_values_.trunc_multiplier.load());
         config.dbscan_eps = prop_values_.dbscan_eps_multiplier.load() *
                               prop_values_.voxel_size.load();
+        config.use_planar_patches = prop_values_.planar_tiles.load();
+        config.tile_size = prop_values_.tile_size.load();
         return config;
     }
 
     void AddFrozenMeshesToScene(
             const std::vector<FrozenObjectEntry>& new_objects) {
         using namespace rendering;
-        auto* scene = widget3d_->GetScene()->GetScene();
-        rendering::MaterialRecord mesh_mat;
+        auto o3d_scene = widget3d_->GetScene();
+        MaterialRecord mesh_mat;
         mesh_mat.shader = "defaultLit";
         mesh_mat.sRGB_vertex_color = true;
         for (const auto& obj : new_objects) {
@@ -746,11 +1105,11 @@ protected:
                 continue;
             }
             const std::string name =
-                    "object_" + std::to_string(obj.id);
-            if (scene->HasGeometry(name)) {
-                scene->RemoveGeometry(name);
+                    "region_" + std::to_string(obj.id);
+            if (o3d_scene->HasGeometry(name)) {
+                o3d_scene->RemoveGeometry(name);
             }
-            scene->AddGeometry(name, obj.mesh, mesh_mat);
+            o3d_scene->AddGeometry(name, &obj.mesh, mesh_mat, false);
         }
     }
 
@@ -776,13 +1135,12 @@ protected:
             try {
                 object_mesh::SegmentationConfig config =
                         BuildSegmentationConfig();
-                freeze_tracker_.SetConfig(config);
                 std::vector<FrozenObjectEntry> new_objects;
                 {
                     std::lock_guard<std::mutex> model_lock(model_mutex_);
                     auto candidates = object_mesh::ProcessExtractedSurface(
-                            segmentation_pcd, *model_, freeze_tracker_, config,
-                            next_object_id_);
+                            segmentation_pcd, *model_, region_registry_,
+                            plane_atlas_, config, next_object_id_);
                     for (auto& candidate : candidates) {
                         if (!candidate.mesh.HasVertexPositions()) {
                             continue;
@@ -792,6 +1150,14 @@ protected:
                         entry.type = candidate.type;
                         entry.mesh = std::move(candidate.mesh);
                         entry.block_keys = candidate.block_keys;
+                        entry.plane = candidate.plane;
+                        entry.tile_i = candidate.tile_i;
+                        entry.tile_j = candidate.tile_j;
+                        entry.area_m2 = candidate.area_m2;
+                        entry.cell_size = candidate.cell_size;
+                        entry.cell_count = candidate.cell_count;
+                        entry.closure = candidate.closure;
+                        entry.connected = candidate.connected;
                         new_objects.push_back(std::move(entry));
                     }
                 }
@@ -799,18 +1165,29 @@ protected:
                 if (!new_objects.empty()) {
                     {
                         std::lock_guard<std::mutex> lock(frozen_mutex_);
+                        // Growing surfaces re-emit the same id: replace the
+                        // stored entry so JSON/scene stay deduplicated.
                         for (auto& entry : new_objects) {
-                            frozen_objects_.push_back(entry);
+                            bool replaced = false;
+                            for (auto& existing : frozen_objects_) {
+                                if (existing.id == entry.id) {
+                                    existing = entry;
+                                    replaced = true;
+                                    break;
+                                }
+                            }
+                            if (!replaced) {
+                                frozen_objects_.push_back(entry);
+                            }
                         }
                     }
                     frozen_version_.fetch_add(1);
                     utility::LogInfo(
-                            "Frozen {} object(s). Total frozen: {}.",
+                            "Updated {} frozen region(s). Total: {}.",
                             new_objects.size(), frozen_objects_.size());
-                    gui::Application::GetInstance().PostToMainThread(
-                            this, [this, new_objects]() {
-                                AddFrozenMeshesToScene(new_objects);
-                            });
+                    PostGuiTask([this, new_objects]() {
+                        AddFrozenMeshesToScene(new_objects);
+                    });
                 }
             } catch (const std::exception& e) {
                 utility::LogWarning("Object segmentation failed: {}", e.what());
@@ -895,53 +1272,64 @@ protected:
     }
 
     void UpdateSurfaceGeometryOnScene(
-            const t::geometry::PointCloud& render_pcd) {
+            const t::geometry::PointCloud& surface_pcd) {
         using namespace rendering;
-        if (!render_pcd.HasPointPositions()) {
+        t::geometry::PointCloud render_pcd =
+                PrepareRenderPointCloud(surface_pcd);
+        if (!render_pcd.HasPointPositions() || !render_pcd.HasPointColors()) {
             return;
         }
         const int64_t render_count =
                 render_pcd.GetPointPositions().GetLength();
-        auto* scene = widget3d_->GetScene()->GetScene();
-        auto pcd_mat = rendering::MaterialRecord();
+        if (render_count <= 0) {
+            return;
+        }
+
+        auto o3d_scene = widget3d_->GetScene();
+        MaterialRecord pcd_mat;
         pcd_mat.shader = "defaultUnlit";
         pcd_mat.sRGB_vertex_color = true;
 
-        const bool needs_rebuild =
-                !points_geometry_added_ ||
-                last_render_point_count_ == 0 ||
-                render_count > last_render_point_count_ * 12 / 10 ||
-                render_count < last_render_point_count_ * 8 / 10;
-
-        if (needs_rebuild) {
-            if (points_geometry_added_) {
-                scene->RemoveGeometry("points");
-            }
-            scene->AddGeometry("points", render_pcd, pcd_mat);
-            points_geometry_added_ = true;
-        } else {
-            scene->UpdateGeometry("points", render_pcd,
-                                  Scene::kUpdatePointsFlag |
-                                          Scene::kUpdateColorsFlag);
+        display_points_legacy_ =
+                std::make_shared<geometry::PointCloud>(render_pcd.ToLegacy());
+        if (points_geometry_added_) {
+            o3d_scene->RemoveGeometry("points");
         }
+        o3d_scene->AddGeometry("points", display_points_legacy_.get(), pcd_mat,
+                               false);
+        points_geometry_added_ = true;
         last_render_point_count_ = render_count;
 
         auto tbbox = render_pcd.GetAxisAlignedBoundingBox();
         geometry::AxisAlignedBoundingBox bbox = tbbox.ToLegacy();
-        if (bbox.Volume() > 0) {
-            Eigen::Vector3f center = bbox.GetCenter().cast<float>();
-            const float center_shift =
-                    camera_fitted_ ? (center - last_camera_center_).norm()
-                                   : 0.0f;
-            if (!camera_fitted_ || center_shift > 0.3f) {
-                widget3d_->SetupCamera(60.0f, bbox, center);
-                last_camera_center_ = center;
-                camera_fitted_ = true;
+        if (bbox.Volume() > 0 && !camera_fitted_) {
+            // World frame equals the first camera frame (x right, y DOWN,
+            // z forward), so the default bbox fit shows the room upside
+            // down. Fit the projection, then enforce an upright view
+            // (up = -y) from the initial camera side. Fit only once: later
+            // bbox changes (e.g. live points shrinking when surfaces are
+            // frozen) must not re-orient the view.
+            const Eigen::Vector3f center = bbox.GetCenter().cast<float>();
+            widget3d_->SetupCamera(60.0f, bbox, center);
+            Eigen::Vector3f up(0.0f, -1.0f, 0.0f);
+            Eigen::Vector3f dir = center;
+            if (dir.norm() < 0.3f) {
+                dir = Eigen::Vector3f(0.0f, 0.0f, 1.0f);
             }
+            dir.normalize();
+            if (std::abs(dir.dot(up)) > 0.95f) {
+                // Looking straight up/down: use z as the up direction.
+                up = Eigen::Vector3f(0.0f, 0.0f, -1.0f);
+            }
+            const float dist = std::max(
+                    1.0f,
+                    1.5f * static_cast<float>(bbox.GetExtent().norm()));
+            widget3d_->LookAt(center, center - dir * dist, up);
+            camera_fitted_ = true;
         }
     }
 
-    void InitSlamModelOnMainThread() {
+    void InitSlamModel() {
         if (is_started_) {
             return;
         }
@@ -987,7 +1375,6 @@ protected:
     }
 
     void StartSlam() {
-        InitSlamModelOnMainThread();
         is_running_ = true;
         if (resume_toggle_) {
             resume_toggle_->SetOn(true);
@@ -1038,10 +1425,16 @@ protected:
     }
 
     void UpdateMainImpl() {
-        while (!is_started_ && !is_done_) {
+        while (!is_running_.load() && !is_done_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         if (is_done_) {
+            return;
+        }
+
+        InitSlamModel();
+        if (!model_) {
+            utility::LogWarning("SLAM model initialization failed.");
             return;
         }
 
@@ -1050,21 +1443,21 @@ protected:
         core::Tensor T_frame_to_model = core::Tensor::Eye(
                 4, core::Dtype::Float64, core::Device("CPU:0"));
 
-        t::geometry::RGBDImage ref_rgbd_input =
-                CaptureInputFrame(0).To(device_);
-        if (ref_rgbd_input.IsEmpty()) {
+        t::geometry::RGBDImage ref_rgbd_cpu = CaptureInputFrame(0);
+        if (ref_rgbd_cpu.IsEmpty()) {
             if (HandleEmptyFrame(0, "startup")) {
                 return;
             }
-            ref_rgbd_input = CaptureInputFrame(0).To(device_);
-            if (ref_rgbd_input.IsEmpty() &&
+            ref_rgbd_cpu = CaptureInputFrame(0);
+            if (ref_rgbd_cpu.IsEmpty() &&
                 HandleEmptyFrame(0, "startup_retry")) {
                 return;
             }
         }
-        if (ref_rgbd_input.IsEmpty()) {
+        if (ref_rgbd_cpu.IsEmpty()) {
             return;
         }
+        t::geometry::RGBDImage ref_rgbd_input = ref_rgbd_cpu.To(device_);
 
         t::pipelines::slam::Frame input_frame(ref_rgbd_input.depth_.GetRows(),
                                               ref_rgbd_input.depth_.GetCols(),
@@ -1083,11 +1476,13 @@ protected:
         auto raycast_depth_colored = std::make_shared<geometry::Image>();
 
         color = std::make_shared<geometry::Image>(
-                ref_rgbd_input.color_.ToLegacy());
+                ref_rgbd_input.color_.To(core::Device("CPU:0")).ToLegacy());
 
         depth_colored = std::make_shared<geometry::Image>(
-                ref_rgbd_input.depth_
-                        .ColorizeDepth(depth_scale, 0.3, prop_values_.depth_max)
+                ref_rgbd_input.depth_.To(core::Device("CPU:0"))
+                        .ColorizeDepth(
+                                static_cast<float>(depth_scale), 0.3,
+                                prop_values_.depth_max.load())
                         .ToLegacy());
 
         raycast_color = std::make_shared<geometry::Image>(
@@ -1105,38 +1500,18 @@ protected:
                                            core::Device("CPU:0")))
                         .ToLegacy());
 
-        // Add placeholder in case color raycast is disabled in the beginning.
+        // Placeholder color must live on the same device as raycast_frame.
         raycast_frame.SetData(
                 "color",
                 core::Tensor::Zeros({ref_rgbd_input.depth_.GetRows(),
                                      ref_rgbd_input.depth_.GetCols(), 3},
-                                    core::Dtype::UInt8, core::Device("CPU:0")));
+                                    core::Dtype::UInt8, device_));
 
         camera::PinholeCameraParameters traj_param;
         traj_param.intrinsic_ = camera::PinholeCameraIntrinsic(
                 ref_rgbd_input.depth_.GetRows(),
                 ref_rgbd_input.depth_.GetCols(),
                 core::eigen_converter::TensorToEigenMatrixXd(intrinsic_));
-
-        // Render once to refresh
-        gui::Application::GetInstance().PostToMainThread(
-                this, [this, color, depth_colored, raycast_color,
-                       raycast_depth_colored]() {
-                    this->input_color_image_->UpdateImage(color);
-                    this->input_depth_image_->UpdateImage(depth_colored);
-                    this->raycast_color_image_->UpdateImage(color);
-                    this->raycast_depth_image_->UpdateImage(depth_colored);
-                    this->SetNeedsLayout();  // size of image changed
-
-                    geometry::AxisAlignedBoundingBox bbox(
-                            Eigen::Vector3d(-5, -5, -5),
-                            Eigen::Vector3d(5, 5, 5));
-                    Eigen::Vector3f center = bbox.GetCenter().cast<float>();
-                    this->widget3d_->SetupCamera(60, bbox, center);
-                    this->widget3d_->LookAt(center,
-                                            center - Eigen::Vector3f{0, 1, 3},
-                                            {0.0f, -1.0f, 0.0f});
-                });
 
         Eigen::IOFormat CleanFmt(Eigen::StreamPrecision, 0, ", ", "\n", "[",
                                  "]");
@@ -1186,18 +1561,23 @@ protected:
                     static_cast<int64_t>(hash_capacity * kHashIntegrateFillRatio);
 
             bool tracking_success = true;
-            bool pose_updated = false;
             TrackingTier tracking_tier = TrackingTier::kInit;
             double track_fitness = 1.0;
             double track_translation = 0.0;
+            double track_rotation_deg = 0.0;
             if (idx > 0 && !hash_near_full) {
-                auto classify_tracking = [](double fitness,
-                                            double translation) -> TrackingTier {
-                    if (translation >= kOutlierTranslation) {
+                const double min_fitness = std::max(
+                        kWeakFitnessMin, prop_values_.min_fitness.load());
+                auto classify_tracking =
+                        [min_fitness](double fitness, double translation,
+                                      double rotation_deg) -> TrackingTier {
+                    if (translation >= kOutlierTranslation ||
+                        rotation_deg >= kOutlierRotationDeg) {
                         return TrackingTier::kOutlier;
                     }
-                    if (fitness >= kPoseFitnessMin &&
-                        translation < kPoseTranslationMax) {
+                    if (fitness >= min_fitness &&
+                        translation < kPoseTranslationMax &&
+                        rotation_deg < kPoseRotationMaxDeg) {
                         return TrackingTier::kStrong;
                     }
                     if (fitness >= kWeakFitnessMin &&
@@ -1205,6 +1585,24 @@ protected:
                         return TrackingTier::kWeak;
                     }
                     return TrackingTier::kFail;
+                };
+                // Per-frame motion magnitude from the odometry delta.
+                auto measure_motion = [](const core::Tensor& transformation,
+                                         double& translation,
+                                         double& rotation_deg) {
+                    core::Tensor T_cpu =
+                            transformation
+                                    .To(core::Device("CPU:0"), core::Float64)
+                                    .Contiguous();
+                    const double* t_ptr = T_cpu.GetDataPtr<double>();
+                    translation = std::sqrt(t_ptr[3] * t_ptr[3] +
+                                            t_ptr[7] * t_ptr[7] +
+                                            t_ptr[11] * t_ptr[11]);
+                    const double trace = t_ptr[0] + t_ptr[5] + t_ptr[10];
+                    const double cos_angle = std::max(
+                            -1.0, std::min(1.0, 0.5 * (trace - 1.0)));
+                    rotation_deg = std::acos(cos_angle) *
+                                   (180.0 / 3.14159265358979323846);
                 };
 
                 try {
@@ -1222,79 +1620,147 @@ protected:
                     std::lock_guard<std::mutex> model_lock(model_mutex_);
                     auto result = run_tracking(
                             static_cast<float>(prop_values_.depth_diff));
-                    core::Tensor translation =
-                            result.transformation_.Slice(0, 0, 3).Slice(1, 3, 4);
-                    track_translation = std::sqrt(
-                            (translation * translation)
-                                    .Sum({0, 1})
-                                    .Item<double>());
+                    measure_motion(result.transformation_, track_translation,
+                                   track_rotation_deg);
                     track_fitness = result.fitness_;
                     tracking_tier = classify_tracking(track_fitness,
-                                                      track_translation);
+                                                      track_translation,
+                                                      track_rotation_deg);
 
                     if (tracking_tier == TrackingTier::kFail &&
                         track_fitness < kWeakFitnessMin) {
                         result = run_tracking(static_cast<float>(
                                 prop_values_.depth_diff * 2.0));
-                        translation = result.transformation_.Slice(0, 0, 3)
-                                              .Slice(1, 3, 4);
-                        track_translation = std::sqrt(
-                                (translation * translation)
-                                        .Sum({0, 1})
-                                        .Item<double>());
+                        measure_motion(result.transformation_,
+                                       track_translation, track_rotation_deg);
                         track_fitness = result.fitness_;
                         tracking_tier = classify_tracking(track_fitness,
-                                                          track_translation);
+                                                          track_translation,
+                                                          track_rotation_deg);
                     }
 
                     if (tracking_tier == TrackingTier::kStrong) {
+                        // Strong frames always update the pose so the raycast
+                        // follows the camera (also during relocalization).
                         T_frame_to_model =
                                 T_frame_to_model.Matmul(result.transformation_);
-                        pose_updated = true;
+                    }
+                } catch (const std::exception& e) {
+                    tracking_tier = TrackingTier::kFail;
+                    utility::LogWarning(
+                            "Tracking exception for frame {}: {}", idx,
+                            e.what());
+                }
+
+                if (tracking_tier == TrackingTier::kStrong) {
+                    consecutive_tracking_failures_ = 0;
+                    if (relocalizing_) {
+                        // Integration stays paused until enough consecutive
+                        // Strong frames confirm the pose is locked again.
+                        ++relocalize_strong_streak_;
+                        if (relocalize_strong_streak_ >=
+                            kRelocalizeStrongFrames) {
+                            relocalizing_ = false;
+                            relocalize_strong_streak_ = 0;
+                            tracking_success = true;
+                            utility::LogInfo(
+                                    "Relocalized at frame {}. Resuming "
+                                    "integration.",
+                                    idx);
+                        } else {
+                            tracking_success = false;
+                        }
+                    } else {
                         tracking_success = true;
-                        consecutive_tracking_failures_ = 0;
-                    } else if (tracking_tier == TrackingTier::kWeak) {
-                        tracking_success = true;
-                        consecutive_tracking_failures_ = 0;
+                    }
+                } else {
+                    // Weak / failed / outlier: never integrate and never move
+                    // the pose; a wrong pose would stamp a duplicate surface.
+                    tracking_success = false;
+                    relocalize_strong_streak_ = 0;
+                    ++consecutive_tracking_failures_;
+                    if (tracking_tier == TrackingTier::kWeak) {
                         utility::LogDebug(
                                 "Weak tracking frame {}: fitness {:.3f}, "
-                                "translation {:.3f}. Integrating with previous "
-                                "pose.",
-                                idx, track_fitness, track_translation);
+                                "translation {:.3f} m, rotation {:.1f} deg. "
+                                "Skipping integration.",
+                                idx, track_fitness, track_translation,
+                                track_rotation_deg);
                     } else {
-                        tracking_success = false;
-                        ++consecutive_tracking_failures_;
                         const char* tier_name =
                                 tracking_tier == TrackingTier::kOutlier
                                         ? "outlier"
                                         : "failed";
                         utility::LogWarning(
                                 "Tracking {} for frame {}, fitness: {:.3f}, "
-                                "translation: {:.3f}. Skipping integration.",
+                                "translation: {:.3f} m, rotation: {:.1f} deg. "
+                                "Skipping integration.",
                                 tier_name, idx, track_fitness,
-                                track_translation);
+                                track_translation, track_rotation_deg);
                     }
-                } catch (const std::exception& e) {
-                    tracking_success = false;
-                    tracking_tier = TrackingTier::kFail;
-                    ++consecutive_tracking_failures_;
-                    utility::LogWarning(
-                            "Tracking exception for frame {}: {}", idx,
-                            e.what());
+                    if (!relocalizing_ &&
+                        consecutive_tracking_failures_ >=
+                                kRelocalizeAfterFailures) {
+                        relocalizing_ = true;
+                        utility::LogWarning(
+                                "Tracking unreliable for {} frames. "
+                                "Relocalizing: integration paused until {} "
+                                "consecutive strong frames.",
+                                consecutive_tracking_failures_,
+                                kRelocalizeStrongFrames);
+                    }
                 }
             } else if (idx > 0 && hash_near_full) {
                 tracking_success = false;
                 tracking_tier = TrackingTier::kFail;
             }
 
+            // Stationary gate: with the camera still, voxel weights are
+            // already saturated, so further integration only wastes GPU time
+            // and lets depth noise allocate new blocks.
+            if (tracking_tier == TrackingTier::kStrong && !relocalizing_ &&
+                track_translation < kStationaryTranslationMax &&
+                track_rotation_deg < kStationaryRotationMaxDeg) {
+                ++stationary_frames_;
+            } else {
+                stationary_frames_ = 0;
+            }
+            const bool integration_idle =
+                    stationary_frames_ >= kStationaryFrames;
+
             model_->UpdateFramePose(idx, T_frame_to_model);
-            const bool integrated = tracking_success;
+            const bool integrated = tracking_success && !integration_idle;
             {
                 std::lock_guard<std::mutex> model_lock(model_mutex_);
                 if (integrated && !hash_near_full) {
                     model_->Integrate(input_frame, depth_scale,
                                       prop_values_.depth_max,
                                       prop_values_.trunc_multiplier);
+                    // Periodically erase ghost voxels observed as free space
+                    // by this trusted (Strong-tracked) frame.
+                    const int carve_interval = device_.IsCUDA()
+                                                       ? kCarveIntervalCuda
+                                                       : kCarveIntervalCpu;
+                    if (tracking_tier == TrackingTier::kStrong &&
+                        idx % carve_interval == 0) {
+                        try {
+                            utility::Timer carve_timer;
+                            carve_timer.Start();
+                            CarveFreeSpace(
+                                    input_frame.GetDataAsImage("depth")
+                                            .AsTensor(),
+                                    T_frame_to_model, depth_scale,
+                                    static_cast<float>(
+                                            prop_values_.depth_max.load()));
+                            carve_timer.Stop();
+                            utility::LogDebug(
+                                    "Free-space carving took {:.1f} ms.",
+                                    carve_timer.GetDurationInMillisecond());
+                        } catch (const std::exception& e) {
+                            utility::LogWarning(
+                                    "Free-space carving failed: {}", e.what());
+                        }
+                    }
                 } else if (integrated && hash_near_full) {
                     utility::LogWarning(
                             "Voxel hash map nearly full ({}/{}). Skipping "
@@ -1353,6 +1819,7 @@ protected:
             std::shared_ptr<geometry::Image> post_raycast_color;
             std::shared_ptr<geometry::Image> post_raycast_depth_colored;
             std::shared_ptr<geometry::LineSet> post_frustum;
+            std::shared_ptr<geometry::LineSet> post_traj;
             std::string post_info;
             std::string post_fps;
 
@@ -1369,7 +1836,16 @@ protected:
                 if (hash_near_full) {
                     info << "Hash map nearly full: integration paused.\n";
                 }
-                if (consecutive_tracking_failures_ > 5) {
+                if (integration_idle) {
+                    info << "Integration idle (camera stationary).\n";
+                }
+                if (relocalizing_) {
+                    info << fmt::format(
+                            "Relocalizing: move slowly back to the scanned "
+                            "area ({}/{} strong frames).\n",
+                            relocalize_strong_streak_,
+                            kRelocalizeStrongFrames);
+                } else if (consecutive_tracking_failures_ > 5) {
                     info << fmt::format(
                             "Tracking lost: {} frames. Move slowly back to the "
                             "scanned area.\n",
@@ -1386,26 +1862,16 @@ protected:
                                         prop_values_.estimated_points);
                 }
                 {
-                    std::lock_guard<std::mutex> lock(frozen_mutex_);
-                    if (!frozen_objects_.empty()) {
-                        std::unordered_map<object_mesh::ObjectType, int>
-                                type_counts;
-                        for (const auto& obj : frozen_objects_) {
-                            ++type_counts[obj.type];
-                        }
-                        info << fmt::format("Frozen objects: {} (",
-                                            frozen_objects_.size());
-                        bool first = true;
-                        for (const auto& [type, count] : type_counts) {
-                            if (!first) {
-                                info << ", ";
-                            }
-                            info << fmt::format("{}×{}", count,
-                                                object_mesh::ObjectTypeName(
-                                                        type));
-                            first = false;
-                        }
-                        info << ")\n";
+                    const std::string surface_summary =
+                            plane_atlas_.FormatSummary(6);
+                    if (!surface_summary.empty()) {
+                        info << surface_summary;
+                    }
+                    const int frozen_regions =
+                            region_registry_.FrozenCount();
+                    if (frozen_regions > 0) {
+                        info << fmt::format("Frozen regions: {}\n",
+                                            frozen_regions);
                     }
                 }
                 info << "\n";
@@ -1420,23 +1886,36 @@ protected:
                         K_eigen, T_eigen.inverse(), 0.2);
                 post_frustum->PaintUniformColor(kTangoOrange);
 
+                if (traj->points_.size() > 1) {
+                    post_traj = std::make_shared<geometry::LineSet>(*traj);
+                }
+
                 post_color = std::make_shared<geometry::Image>(
-                        input_frame.GetDataAsImage("color").ToLegacy());
+                        input_frame.GetDataAsImage("color")
+                                .To(core::Device("CPU:0"))
+                                .ToLegacy());
                 post_depth_colored = std::make_shared<geometry::Image>(
                         input_frame.GetDataAsImage("depth")
-                                .ColorizeDepth(depth_scale, 0.3,
-                                               prop_values_.depth_max)
+                                .To(core::Device("CPU:0"))
+                                .ColorizeDepth(
+                                        static_cast<float>(depth_scale), 0.3,
+                                        static_cast<float>(
+                                                prop_values_.depth_max.load()))
                                 .ToLegacy());
-                if (prop_values_.raycast_color) {
+                if (prop_values_.raycast_color.load()) {
                     post_raycast_color = std::make_shared<geometry::Image>(
                             raycast_frame.GetDataAsImage("color")
+                                    .To(core::Device("CPU:0"))
                                     .To(core::Dtype::UInt8, false, 255.0f)
                                     .ToLegacy());
                 }
                 post_raycast_depth_colored = std::make_shared<geometry::Image>(
                         raycast_frame.GetDataAsImage("depth")
-                                .ColorizeDepth(depth_scale, 0.3,
-                                               prop_values_.depth_max)
+                                .To(core::Device("CPU:0"))
+                                .ColorizeDepth(
+                                        static_cast<float>(depth_scale), 0.3,
+                                        static_cast<float>(
+                                                prop_values_.depth_max.load()))
                                 .ToLegacy());
             }
 
@@ -1457,16 +1936,16 @@ protected:
             }
 
             if (post_gui_this_frame) {
-            gui::Application::GetInstance().PostToMainThread(
-                    this, [this, post_color, post_depth_colored,
-                           post_raycast_color, post_raycast_depth_colored, traj,
-                           post_frustum, post_info, post_fps, surface_version]() {
+            PostGuiTask([this, post_color, post_depth_colored,
+                         post_raycast_color, post_raycast_depth_colored,
+                         post_traj, post_frustum, post_info, post_fps,
+                         surface_version]() {
                         try {
                         last_surface_version_gui_ = surface_version;
                         this->fixed_props_->SetEnabled(false);
 
                         this->raycast_color_image_->SetVisible(
-                                this->prop_values_.raycast_color);
+                                this->prop_values_.raycast_color.load());
 
                         this->SetInfo(post_info);
                         this->SetFPS(post_fps);
@@ -1477,7 +1956,8 @@ protected:
                             this->input_depth_image_->UpdateImage(
                                     post_depth_colored);
                         }
-                        if (prop_values_.raycast_color && post_raycast_color) {
+                        if (prop_values_.raycast_color.load() &&
+                            post_raycast_color) {
                             this->raycast_color_image_->UpdateImage(
                                     post_raycast_color);
                         }
@@ -1495,16 +1975,16 @@ protected:
                                     "frustum", post_frustum.get(), mat);
                         }
 
-                        if (traj->points_.size() > 1) {
+                        if (post_traj && post_traj->points_.size() > 1) {
                             if (!trajectory_geometry_added_) {
                                 this->widget3d_->GetScene()->AddGeometry(
-                                        "trajectory", traj.get(), mat);
+                                        "trajectory", post_traj.get(), mat);
                                 trajectory_geometry_added_ = true;
                             } else {
                                 this->widget3d_->GetScene()->RemoveGeometry(
                                         "trajectory");
                                 this->widget3d_->GetScene()->AddGeometry(
-                                        "trajectory", traj.get(), mat);
+                                        "trajectory", post_traj.get(), mat);
                             }
                         }
 
@@ -1514,9 +1994,7 @@ protected:
                             surface_pcd = surface_.pcd;
                         }
                         if (surface_pcd.HasPointPositions()) {
-                            t::geometry::PointCloud render_pcd =
-                                    PrepareRenderPointCloud(surface_pcd);
-                            UpdateSurfaceGeometryOnScene(render_pcd);
+                            UpdateSurfaceGeometryOnScene(surface_pcd);
                         }
                         } catch (const std::exception& e) {
                             utility::LogWarning(
@@ -1526,6 +2004,7 @@ protected:
                                     "GUI update failed with unknown exception.");
                         }
                     });
+                WaitForPendingGui();
             }
 
             // Note that the user might have closed the window, in which case we

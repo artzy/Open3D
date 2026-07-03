@@ -36,7 +36,22 @@ struct FrozenMeshEntry {
     geometry::TriangleMesh mesh_legacy;
     std::shared_ptr<geometry::PointCloud> snapshot_pcd;
     core::Tensor block_keys;
+    Eigen::Vector4d plane = Eigen::Vector4d::Zero();
+    int tile_i = 0;
+    int tile_j = 0;
+    double area_m2 = 0.0;
+    // Growing plane surface fields; an entry re-emitted with a known id is
+    // a grown replacement of the previous mesh.
+    double cell_size = 0.0;
+    int cell_count = 0;
+    double closure = 0.0;
+    std::vector<int> connected;
 };
+
+inline std::string FrozenMeshFileName(const FrozenMeshEntry& entry) {
+    return (object_mesh::IsPlanarType(entry.type) ? "surface_" : "object_") +
+           std::to_string(entry.id) + ".ply";
+}
 
 inline void ClampMeshColors(geometry::TriangleMesh& mesh) {
     for (auto& c : mesh.vertex_colors_) {
@@ -55,16 +70,17 @@ inline void ClampPcdColors(geometry::PointCloud& pcd) {
 class IncrementalMeshFreeze {
 public:
     explicit IncrementalMeshFreeze(const IncrementalFreezeConfig& config)
-        : config_(config), tracker_(config.segmentation) {}
+        : config_(config) {}
 
     void UpdateConfig(const IncrementalFreezeConfig& config) {
         config_ = config;
-        tracker_.SetConfig(config.segmentation);
     }
 
     const IncrementalFreezeConfig& GetConfig() const { return config_; }
 
-    /// Runs DBSCAN + stability tracking; freezes TSDF blocks and builds meshes.
+    /// Partitions the surface into regions (planar tiles + DBSCAN clusters),
+    /// tracks stability in the RegionRegistry; freezes TSDF blocks and
+    /// builds meshes.
     std::vector<FrozenMeshEntry> ProcessSurface(
             const t::geometry::PointCloud& surface_pcd,
             t::pipelines::slam::Model& model) {
@@ -76,7 +92,8 @@ public:
 
         object_mesh::SegmentationConfig seg_cfg = config_.segmentation;
         auto candidates = object_mesh::ProcessExtractedSurface(
-                surface_pcd, model, tracker_, seg_cfg, next_object_id_);
+                surface_pcd, model, registry_, atlas_, seg_cfg,
+                next_object_id_);
 
         const geometry::PointCloud surface_legacy = surface_pcd.ToLegacy();
 
@@ -90,6 +107,14 @@ public:
             entry.mesh_legacy = candidate.mesh.ToLegacy();
             ClampMeshColors(entry.mesh_legacy);
             entry.block_keys = candidate.block_keys;
+            entry.plane = candidate.plane;
+            entry.tile_i = candidate.tile_i;
+            entry.tile_j = candidate.tile_j;
+            entry.area_m2 = candidate.area_m2;
+            entry.cell_size = candidate.cell_size;
+            entry.cell_count = candidate.cell_count;
+            entry.closure = candidate.closure;
+            entry.connected = candidate.connected;
 
             if (config_.save_point_cloud_snapshot &&
                 candidate.bounds.Volume() > 0.0) {
@@ -101,14 +126,27 @@ public:
                 }
             }
 
-            all_frozen_.push_back(entry);
+            // Growing surfaces re-emit the same id: replace the previous
+            // entry so the manifest and mesh files stay deduplicated.
+            bool replaced = false;
+            for (auto& existing : all_frozen_) {
+                if (existing.id == entry.id) {
+                    existing = entry;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                all_frozen_.push_back(entry);
+            }
             new_entries.push_back(entry);
 
             utility::LogInfo(
-                    "Frozen object {} ({}) — {} vertices, {} blocks.",
-                    entry.id, object_mesh::ObjectTypeName(entry.type),
+                    "{} region {} ({}) — {} vertices, closure {:.0f}%.",
+                    replaced ? "Grew" : "Frozen", entry.id,
+                    object_mesh::ObjectTypeName(entry.type),
                     entry.mesh_legacy.vertices_.size(),
-                    entry.block_keys.GetLength());
+                    entry.closure * 100.0);
         }
 
         if (config_.auto_save && !new_entries.empty()) {
@@ -143,8 +181,7 @@ public:
         blocks_json << "{\n  \"objects\": [\n";
         for (size_t i = 0; i < all_frozen_.size(); ++i) {
             const auto& obj = all_frozen_[i];
-            const std::string mesh_path =
-                    "object_" + std::to_string(obj.id) + ".ply";
+            const std::string mesh_path = FrozenMeshFileName(obj);
             const std::string pcd_path =
                     "pcd_" + std::to_string(obj.id) + ".ply";
 
@@ -152,6 +189,16 @@ public:
             blocks_json << "      \"id\": " << obj.id << ",\n";
             blocks_json << "      \"type\": \""
                         << object_mesh::ObjectTypeName(obj.type) << "\",\n";
+            blocks_json << "      \"state\": \"frozen\",\n";
+            if (object_mesh::IsPlanarType(obj.type)) {
+                blocks_json << fmt::format(
+                        "      \"plane\": [{:.6f}, {:.6f}, {:.6f}, "
+                        "{:.6f}],\n",
+                        obj.plane(0), obj.plane(1), obj.plane(2),
+                        obj.plane(3));
+            }
+            blocks_json << fmt::format("      \"area_m2\": {:.3f},\n",
+                                       obj.area_m2);
             blocks_json << "      \"mesh\": \"" << mesh_path << "\"";
             if (obj.snapshot_pcd) {
                 blocks_json << ",\n      \"point_cloud\": \"" << pcd_path
@@ -174,6 +221,30 @@ public:
             }
             blocks_json << "\n    }";
             if (i + 1 < all_frozen_.size()) {
+                blocks_json << ",";
+            }
+            blocks_json << "\n";
+        }
+        blocks_json << "  ],\n  \"surfaces\": [\n";
+        const auto surfaces = atlas_.Snapshot();
+        for (size_t i = 0; i < surfaces.size(); ++i) {
+            const auto& s = surfaces[i];
+            blocks_json << fmt::format(
+                    "    {{\"id\": {}, \"type\": \"{}\", \"plane\": "
+                    "[{:.6f}, {:.6f}, {:.6f}, {:.6f}], \"cell_size\": "
+                    "{:.3f}, \"cell_count\": {}, \"closure\": {:.3f}, "
+                    "\"connected\": [",
+                    s.id, object_mesh::ObjectTypeName(s.type), s.plane(0),
+                    s.plane(1), s.plane(2), s.plane(3), s.cell_size,
+                    s.cell_count, s.closure);
+            for (size_t k = 0; k < s.connected.size(); ++k) {
+                if (k > 0) {
+                    blocks_json << ", ";
+                }
+                blocks_json << s.connected[k];
+            }
+            blocks_json << "]}";
+            if (i + 1 < surfaces.size()) {
                 blocks_json << ",";
             }
             blocks_json << "\n";
@@ -203,8 +274,8 @@ private:
     }
 
     void SaveEntryFiles(const FrozenMeshEntry& entry) const {
-        const std::string mesh_path = config_.output_dir + "/object_" +
-                                      std::to_string(entry.id) + ".ply";
+        const std::string mesh_path =
+                config_.output_dir + "/" + FrozenMeshFileName(entry);
         try {
             io::WriteTriangleMesh(mesh_path, entry.mesh_legacy);
         } catch (const std::exception& e) {
@@ -223,7 +294,8 @@ private:
     }
 
     IncrementalFreezeConfig config_;
-    object_mesh::ObjectFreezeTracker tracker_;
+    object_mesh::RegionRegistry registry_;
+    object_mesh::PlaneSurfaceAtlas atlas_;
     int next_object_id_ = 0;
     std::vector<FrozenMeshEntry> all_frozen_;
 };

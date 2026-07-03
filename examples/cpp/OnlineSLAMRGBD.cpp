@@ -169,11 +169,13 @@ int main(int argc, char* argv[]) {
     const size_t max_idx = depth_files.size();
     auto get_rgbd_image_input = [&](const size_t idx) {
         if (idx < max_idx) {
-            t::geometry::Image depth =
-                    *t::io::CreateImageFromFile(depth_files[idx]);
-            t::geometry::Image color =
-                    *t::io::CreateImageFromFile(rgb_files[idx]);
-            t::geometry::RGBDImage rgbd_im(color, depth, align_streams);
+            auto depth_ptr = t::io::CreateImageFromFile(depth_files[idx]);
+            auto color_ptr = t::io::CreateImageFromFile(rgb_files[idx]);
+            if (!depth_ptr || !color_ptr) {
+                utility::LogWarning("Failed to read RGB-D frame {}.", idx);
+                return t::geometry::RGBDImage();
+            }
+            t::geometry::RGBDImage rgbd_im(*color_ptr, *depth_ptr, align_streams);
             return rgbd_im;
         } else {
             // Return empty image to indicate EOF.
