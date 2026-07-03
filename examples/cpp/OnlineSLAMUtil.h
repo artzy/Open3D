@@ -353,7 +353,9 @@ public:
                 {"dbscan_eps_multiplier", 2.0},
                 {"min_cluster_points", 5000},
                 {"planar_tiles", 1},
-                {"tile_size", 1.0}};
+                {"tile_size", 1.0},
+                {"show_camera", 1},
+                {"show_path", 1}};
         /// Override values by user provided default parameters
         for (auto it : default_parameters_) {
             if (default_param.find(it.first) != default_param.end()) {
@@ -468,6 +470,14 @@ public:
                 default_param.at("tile_size"), 0.5, 2.0,
                 "Edge length (m) of plane-local tiles used to partition "
                 "large planar regions.");
+        adjustable_props_->AddBool(
+                "Show camera", &prop_values_.show_camera,
+                default_param.at("show_camera") > 0.5,
+                "Show the current camera frustum in the 3D view.");
+        adjustable_props_->AddBool(
+                "Show path", &prop_values_.show_path,
+                default_param.at("show_path") > 0.5,
+                "Show the camera trajectory (path) in the 3D view.");
 
         panel_->AddChild(std::make_shared<gui::Label>("Starting settings"));
         panel_->AddChild(fixed_props_);
@@ -785,6 +795,8 @@ protected:
         std::atomic<int> min_cluster_points;
         std::atomic<bool> planar_tiles;
         std::atomic<double> tile_size;
+        std::atomic<bool> show_camera;
+        std::atomic<bool> show_path;
     } prop_values_;
 
     struct {
@@ -1970,22 +1982,26 @@ protected:
                         auto mat = rendering::MaterialRecord();
                         mat.shader = "unlitLine";
                         mat.line_width = 5.0f;
-                        if (post_frustum) {
+                        if (post_frustum &&
+                            this->prop_values_.show_camera.load()) {
                             this->widget3d_->GetScene()->AddGeometry(
                                     "frustum", post_frustum.get(), mat);
                         }
 
-                        if (post_traj && post_traj->points_.size() > 1) {
-                            if (!trajectory_geometry_added_) {
-                                this->widget3d_->GetScene()->AddGeometry(
-                                        "trajectory", post_traj.get(), mat);
-                                trajectory_geometry_added_ = true;
-                            } else {
+                        if (!this->prop_values_.show_path.load()) {
+                            if (trajectory_geometry_added_) {
                                 this->widget3d_->GetScene()->RemoveGeometry(
                                         "trajectory");
-                                this->widget3d_->GetScene()->AddGeometry(
-                                        "trajectory", post_traj.get(), mat);
+                                trajectory_geometry_added_ = false;
                             }
+                        } else if (post_traj && post_traj->points_.size() > 1) {
+                            if (trajectory_geometry_added_) {
+                                this->widget3d_->GetScene()->RemoveGeometry(
+                                        "trajectory");
+                            }
+                            this->widget3d_->GetScene()->AddGeometry(
+                                    "trajectory", post_traj.get(), mat);
+                            trajectory_geometry_added_ = true;
                         }
 
                         t::geometry::PointCloud surface_pcd;
