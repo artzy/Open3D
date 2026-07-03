@@ -34,6 +34,10 @@ surface)** 을 freeze한 뒤 인접 평면을 연결해 메시를 키워가며 �
   `min_cell_coverage`(기본 20%) 이상 관측 포인트가 쌓여야 렌더링됨 —
   **확인된 클라우드 포인트가 있는 영역 안에서만 평면이 형성**되고, 산발적
   노이즈로 셀이 커지지 않는다. (`min_cell_points`=10은 절대 하한)
+- **경계 quad 클리핑**: 셀마다 점의 (u, v) 범위를 기록하고, 경계 격자 정점을
+  인접 점유 셀들의 점 범위 안으로 clamp — 부분만 관측된 경계 셀의 quad가
+  셀 전체(0.25 m)로 튀어나오지 않고 실제 점 범위에서 끝난다. 내부 정점은
+  격자 위치 그대로라 메시 연속성 유지.
 - 메시 = 점유 셀당 quad(삼각형 2개), 인접 셀과 정점 공유 → **납작한 open
   메시**. `CreatePrimitiveMesh`의 평면 타입 박스 생성은 제거.
 - 셀 좌표는 법선에서 유도한 정준(canonical) 평면 축으로 계산해 프레임 간
@@ -56,8 +60,55 @@ surface)** 을 freeze한 뒤 인접 평면을 연결해 메시를 키워가며 �
 - 두 평면의 **교선**을 `[n1; n2; dir]` 3x3 시스템으로 풀고, 경계 정점(한
   셀에만 속한 격자 변의 정점) 중 교선까지 거리 ≤ 스냅 거리인 것을 교선 위로
   투영 — 벽-벽, 벽-바닥 모서리가 틈 없이 봉합된다.
+- **스냅 게이팅**: 교선은 무한 직선이므로, 투영 지점이 **이웃 평면의 실제
+  점유 셀(3x3 이웃) 근처일 때만** 스냅한다. 이웃 기하가 관측되지 않은
+  구간으로 경계가 늘어나 평면이 커지는 것을 방지.
 - 성장으로 이웃 관계가 바뀔 수 있으므로 dirty 표면의 이웃도 함께 재생성.
 - **폐합도(closure)** = 스냅된 경계 정점 비율. Info 탭과 JSON에 표시.
+
+### 건축 표면 필터 (가구 오분류 방지)
+
+평면 패치가 무조건 wall/floor로 승격되면 소파 시트가 "floor", 등받이가
+"wall"이 되어 납작하게 변형된다. 승격 조건을 추가:
+
+- **수평 패치**: 기존 바닥/천장 높이 밴드(`floor_band` 0.15 m) 안에 있을 때만
+  floor/ceiling. 힌트가 없으면 `min_patch_area_m2`(1.5 m²) 이상의 큰 패치만
+  시드 가능. 소파 시트·테이블 상판은 거부.
+- **수직 패치**: y extent ≥ `min_wall_height`(0.8 m) 또는 면적 ≥ 1.5 m²일
+  때만 wall. 등받이 크기는 거부.
+- 거부된 패치의 점은 claim되지 않고 DBSCAN 객체 경로로 흘러간다.
+
+### 객체는 실제 형상 유지
+
+box/cylinder로 분류된 클러스터도 primitive 대신 **TSDF marching cubes
+메시**를 우선 사용 (빈 메시일 때만 primitive 폴백). 소파는 스캔된 실제
+형상 그대로 freeze된다. 타입 라벨은 GUI/JSON에 유지.
+
+건축 필터는 DBSCAN 경로에도 적용된다: `ClassifyCluster`가 kWall로 재분류한
+클러스터(소파 등받이 등)는 동일한 크기 게이트(y extent ≥ min_wall_height
+또는 실측 면적 ≥ min_patch_area_m2)를 통과해야 평면 atlas로 가고, 탈락하면
+kGeneric으로 강등되어 실제 형상으로 freeze된다. 면적 판정은 OBB 사각형
+대신 **실측 추정**(점 개수 x voxel_size², `EstimateSurfaceArea`)을 사용해
+희박한 패치의 과대평가를 제거했다.
+
+### 섬 영역 미평면화 해소 (frozen 블록 겹침 함정)
+
+주변이 먼저 freeze된 "섬" 영역이 영원히 평면화되지 못하는 함정이 있었다:
+등록 블록 키가 truncation 대역만큼 부풀려져 이웃 frozen 평면의 블록이 섬
+가장자리까지 침범하고, 섬 후보는 frozen 겹침 30% 초과로 반복 폐기됐다
+(진단 로그로 32~49% 겹침 반복 폐기 확인).
+
+수정 (`RegionRegistry::UpdateBatch`):
+
+- **core 블록 키 판정**: frozen 겹침·매칭 투표를 부풀림 없는 core 키(점이
+  실제 들어 있는 블록, `CoreKeysFromPoints`)로 수행 — 이웃의 truncation
+  침범 블록이 카운트되지 않음. 폐기 임계값 30% → 60%.
+- **폐기 대신 축소 진행**: frozen region이 소유한 블록을 제외한 나머지
+  키로 등록/freeze 진행 (경계 소유권은 먼저 얼어붙은 region 유지).
+
+수정 후: 폐기는 core 기준 60~100% 겹침(진짜 재관측)만 발생, 이전에 32~41%
+겹침으로 폐기되던 floor 후보들이 정상 freeze됨 (Lounge 90초에서 표면 7 →
+10개, 주 바닥 옆 러그 높이의 floor 표면 2개 추가 확인).
 
 ## GUI / 저장
 
@@ -105,3 +156,6 @@ surface)** 을 freeze한 뒤 인접 평면을 연결해 메시를 키워가며 �
 | `surface_merge_dist` | 0.02 m | coplanar 병합 offset 허용 |
 | `snap_angle_deg` | 30.0 | 연결 대상 최소 평면 사이각 |
 | `snap_dist_factor` | 1.5 | 스냅 거리 = factor x cell_size |
+| `min_wall_height` | 0.8 m | wall 승격 최소 수직 extent |
+| `min_patch_area_m2` | 1.5 m² | 크기 기준 대체 승격 조건 |
+| `floor_band` | 0.15 m | 바닥/천장 높이 허용 밴드 |

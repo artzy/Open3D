@@ -21,11 +21,13 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "open3d/Open3D.h"
@@ -102,6 +104,12 @@ struct SegmentationConfig {
     double surface_merge_dist = 0.02;       // coplanar |d| tolerance (m)
     double snap_angle_deg = 30.0;      // min angle between connected planes
     double snap_dist_factor = 1.5;     // snap distance = factor * cell_size
+    // Architectural surface filter: only large / height-consistent patches
+    // become plane surfaces; furniture-sized patches (sofa seats, table
+    // tops, backrests) stay in the object path and keep their real shape.
+    double min_wall_height = 0.8;      // min vertical extent of a wall (m)
+    double min_patch_area_m2 = 1.5;    // alt. acceptance by patch area
+    double floor_band = 0.15;          // height band around floor/ceiling (m)
 };
 
 /// One partitioned region candidate produced from a single extracted surface:
@@ -176,12 +184,18 @@ public:
     /// Match a batch of candidates against known regions (majority vote of
     /// their block keys), update stability counters, register new regions and
     /// prune unfrozen regions that were not re-observed.
+    /// Frozen-overlap and matching votes use "core" keys (blocks that
+    /// actually contain candidate points, no truncation inflation): a frozen
+    /// neighbor's inflated block halo must not permanently poison island
+    /// candidates surrounded by frozen surfaces. Keys owned by frozen
+    /// regions are stripped from \p block_keys (shrunk in place) so the
+    /// candidate proceeds with the remainder instead of being dropped.
     /// \returns per-candidate region id (-1 if the candidate was dropped
-    /// because it overlaps an already-frozen region), and fills
+    /// because it lies mostly inside an already-frozen region), and fills
     /// \p ready_to_freeze with region ids whose stability just reached
     /// \p config.stability_frames.
     std::vector<int> UpdateBatch(const std::vector<RegionCandidate>& candidates,
-                                 const std::vector<core::Tensor>& block_keys,
+                                 std::vector<core::Tensor>& block_keys,
                                  const SegmentationConfig& config,
                                  int& next_object_id,
                                  std::vector<int>& ready_to_freeze) {
@@ -189,17 +203,22 @@ public:
         std::vector<int> candidate_region_ids(candidates.size(), -1);
         ready_to_freeze.clear();
 
+        const float block_size = config.voxel_size * 16.0f;
         std::unordered_map<int, bool> seen_this_pass;
         for (size_t c = 0; c < candidates.size(); ++c) {
             const std::vector<BlockKey> keys = ToKeyVector(block_keys[c]);
             if (keys.empty()) {
                 continue;
             }
+            const std::vector<BlockKey> core_keys =
+                    CoreKeysFromPoints(candidates[c].points, block_size);
+            const std::vector<BlockKey>& vote_keys =
+                    core_keys.empty() ? keys : core_keys;
 
             // Majority vote: which region do this candidate's blocks map to?
             std::map<int, int> votes;
             int frozen_hits = 0;
-            for (const BlockKey& key : keys) {
+            for (const BlockKey& key : vote_keys) {
                 auto it = block_to_region_.find(key);
                 if (it == block_to_region_.end()) {
                     continue;
@@ -211,8 +230,33 @@ public:
             }
 
             // Mostly inside an already-frozen region: nothing new to manage.
-            if (frozen_hits * 10 >= static_cast<int>(keys.size()) * 3) {
+            if (frozen_hits * 10 >= static_cast<int>(vote_keys.size()) * 6) {
+                utility::LogDebug(
+                        "Region candidate dropped ({}, {} core blocks, "
+                        "{:.0f}% frozen overlap).",
+                        ObjectTypeName(candidates[c].type), vote_keys.size(),
+                        100.0 * frozen_hits /
+                                static_cast<double>(vote_keys.size()));
                 continue;
+            }
+
+            // Proceed with the blocks not owned by frozen regions; ownership
+            // of shared border blocks stays with whoever froze first.
+            std::vector<BlockKey> kept;
+            kept.reserve(keys.size());
+            for (const BlockKey& key : keys) {
+                auto it = block_to_region_.find(key);
+                if (it != block_to_region_.end() &&
+                    RegionById(it->second)->state == RegionState::kFrozen) {
+                    continue;
+                }
+                kept.push_back(key);
+            }
+            if (kept.empty()) {
+                continue;
+            }
+            if (kept.size() < keys.size()) {
+                block_keys[c] = KeysToTensor(kept);
             }
 
             int best_id = -1;
@@ -227,7 +271,7 @@ public:
 
             Region* region = nullptr;
             if (best_id >= 0 &&
-                best_votes * 2 >= static_cast<int>(keys.size())) {
+                best_votes * 2 >= static_cast<int>(vote_keys.size())) {
                 // Same region as a previous pass: refresh and grow.
                 region = RegionById(best_id);
                 ++region->stable_frames;
@@ -244,7 +288,7 @@ public:
             region->tile_j = candidates[c].tile_j;
             region->area_m2 = candidates[c].area_m2;
             region->block_keys = block_keys[c];
-            for (const BlockKey& key : keys) {
+            for (const BlockKey& key : kept) {
                 // First region to claim a block keeps it (stable ownership at
                 // tile borders).
                 block_to_region_.emplace(key, region->id);
@@ -373,6 +417,44 @@ private:
                        regions_.end());
     }
 
+    /// Blocks that actually contain candidate points (no truncation
+    /// inflation), used for frozen-overlap and matching votes.
+    static std::vector<BlockKey> CoreKeysFromPoints(
+            const t::geometry::PointCloud& points, float block_size) {
+        std::vector<BlockKey> keys;
+        if (!points.HasPointPositions() || block_size <= 0.0f) {
+            return keys;
+        }
+        core::Tensor pos = points.GetPointPositions()
+                                   .To(core::Device("CPU:0"), core::Float32)
+                                   .Contiguous();
+        const float* data = pos.GetDataPtr<float>();
+        const int64_t n = pos.GetLength();
+        std::unordered_set<BlockKey, BlockKeyHash> unique;
+        for (int64_t i = 0; i < n; ++i) {
+            unique.insert({static_cast<int32_t>(
+                                   std::floor(data[i * 3 + 0] / block_size)),
+                           static_cast<int32_t>(
+                                   std::floor(data[i * 3 + 1] / block_size)),
+                           static_cast<int32_t>(
+                                   std::floor(data[i * 3 + 2] / block_size))});
+        }
+        keys.assign(unique.begin(), unique.end());
+        return keys;
+    }
+
+    static core::Tensor KeysToTensor(const std::vector<BlockKey>& keys) {
+        core::Tensor tensor({static_cast<int64_t>(keys.size()), 3},
+                            core::Int32, core::Device("CPU:0"));
+        int32_t* data = tensor.GetDataPtr<int32_t>();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            data[i * 3 + 0] = keys[i].x;
+            data[i * 3 + 1] = keys[i].y;
+            data[i * 3 + 2] = keys[i].z;
+        }
+        return tensor;
+    }
+
     static std::vector<BlockKey> ToKeyVector(const core::Tensor& block_keys) {
         std::vector<BlockKey> keys;
         if (block_keys.NumElements() == 0) {
@@ -401,6 +483,13 @@ private:
 // surfaces onto their plane-plane intersection line so corners close
 // incrementally (instead of freezing closed boxes from the start).
 // ---------------------------------------------------------------------------
+
+/// Measured surface area estimate: TSDF extraction yields roughly one point
+/// per voxel on a surface, so area ~= point_count * voxel_size^2. More
+/// accurate than the OBB rectangle, which overestimates sparse patches.
+inline double EstimateSurfaceArea(size_t point_count, float voxel_size) {
+    return static_cast<double>(point_count) * voxel_size * voxel_size;
+}
 
 /// Canonical in-plane axes derived only from the normal and anchored to the
 /// world axes, so cell coordinates are reproducible across frames.
@@ -504,14 +593,20 @@ public:
             if (std::abs(n.dot(p) + surface->plane(3)) > max_plane_dist) {
                 continue;
             }
+            const double a = surface->u.dot(p);
+            const double b = surface->v.dot(p);
             const int ci = static_cast<int>(
-                    std::floor(surface->u.dot(p) / surface->cell_size));
+                    std::floor(a / surface->cell_size));
             const int cj = static_cast<int>(
-                    std::floor(surface->v.dot(p) / surface->cell_size));
+                    std::floor(b / surface->cell_size));
             Cell& cell = surface->cells[{ci, cj}];
             ++cell.points;
             cell.color_sum += has_colors ? points.colors_[k]
                                          : Eigen::Vector3d(0.7, 0.7, 0.7);
+            cell.min_u = std::min(cell.min_u, a);
+            cell.max_u = std::max(cell.max_u, a);
+            cell.min_v = std::min(cell.min_v, b);
+            cell.max_v = std::max(cell.max_v, b);
         }
         if (tile_block_keys.NumElements() > 0) {
             if (surface->block_keys.NumElements() == 0) {
@@ -619,6 +714,12 @@ private:
     struct Cell {
         Eigen::Vector3d color_sum = Eigen::Vector3d::Zero();
         int points = 0;
+        // Observed point extent in plane coordinates: boundary quads are
+        // clipped to this so the mesh never extends past confirmed points.
+        double min_u = std::numeric_limits<double>::max();
+        double max_u = std::numeric_limits<double>::lowest();
+        double min_v = std::numeric_limits<double>::max();
+        double max_v = std::numeric_limits<double>::lowest();
     };
 
     struct Surface {
@@ -630,6 +731,9 @@ private:
         double cell_size = 0.25;
         double weight = 0.0;  // accumulated samples for plane averaging
         int occupied_cells = 0;  // cells that passed the coverage threshold
+        // Threshold of the last mesh build; used by neighbors to test
+        // whether a snap target lies next to actually observed cells.
+        int occupy_threshold = std::numeric_limits<int>::max();
         std::map<std::pair<int, int>, Cell> cells;
         core::Tensor block_keys;  // union of frozen tile keys (CPU Int32)
         std::vector<int> connected;
@@ -698,6 +802,16 @@ private:
         const int occupy_threshold = std::max(
                 config.min_cell_points,
                 static_cast<int>(config.min_cell_coverage * voxels_per_cell));
+        surface.occupy_threshold = occupy_threshold;
+
+        // Pass 1: collect the cells that pass the coverage threshold.
+        std::map<std::pair<int, int>, const Cell*> occupied;
+        for (const auto& [cell_ij, cell] : surface.cells) {
+            if (cell.points >= occupy_threshold) {
+                occupied.emplace(cell_ij, &cell);
+            }
+        }
+        surface.occupied_cells = static_cast<int>(occupied.size());
 
         std::map<std::pair<int, int>, int> corner_to_vertex;
         std::map<std::pair<int, int>, Eigen::Vector3d> corner_color_sum;
@@ -705,24 +819,45 @@ private:
         // Lattice edge occupancy: key = (i, j, 0 horizontal / 1 vertical).
         std::map<std::tuple<int, int, int>, int> edge_count;
 
+        // Lattice corner clamped into the observed point extent of its
+        // adjacent occupied cells: interior corners stay on the lattice
+        // (fully covered cells), boundary corners are pulled inward so the
+        // mesh ends where the confirmed cloud points end.
         auto corner_vertex = [&](int i, int j) -> int {
             auto it = corner_to_vertex.find({i, j});
             if (it != corner_to_vertex.end()) {
                 return it->second;
             }
+            double a = i * surface.cell_size;
+            double b = j * surface.cell_size;
+            double u_lo = std::numeric_limits<double>::max();
+            double u_hi = std::numeric_limits<double>::lowest();
+            double v_lo = u_lo, v_hi = u_hi;
+            for (int di = -1; di <= 0; ++di) {
+                for (int dj = -1; dj <= 0; ++dj) {
+                    auto itc = occupied.find({i + di, j + dj});
+                    if (itc == occupied.end()) {
+                        continue;
+                    }
+                    u_lo = std::min(u_lo, itc->second->min_u);
+                    u_hi = std::max(u_hi, itc->second->max_u);
+                    v_lo = std::min(v_lo, itc->second->min_v);
+                    v_hi = std::max(v_hi, itc->second->max_v);
+                }
+            }
+            if (u_lo <= u_hi) {
+                a = std::min(std::max(a, u_lo), u_hi);
+                b = std::min(std::max(b, v_lo), v_hi);
+            }
             const int index =
                     static_cast<int>(surface.mesh.vertices_.size());
-            surface.mesh.vertices_.push_back(CornerPosition(
-                    surface, i * surface.cell_size, j * surface.cell_size));
+            surface.mesh.vertices_.push_back(CornerPosition(surface, a, b));
             corner_to_vertex[{i, j}] = index;
             return index;
         };
 
-        for (const auto& [cell_ij, cell] : surface.cells) {
-            if (cell.points < occupy_threshold) {
-                continue;
-            }
-            ++surface.occupied_cells;
+        for (const auto& [cell_ij, cell_ptr] : occupied) {
+            const Cell& cell = *cell_ptr;
             const int i = cell_ij.first;
             const int j = cell_ij.second;
             const int v00 = corner_vertex(i, j);
@@ -844,12 +979,35 @@ private:
                                       0.0);
             const Eigen::Vector3d p0 = A.fullPivLu().solve(rhs);
 
+            // Only snap where the neighbor actually has observed cells: the
+            // intersection line is infinite, and pulling edges toward parts
+            // of it without confirmed points would enlarge the surface.
+            auto near_other_cells = [&](const Eigen::Vector3d& p) {
+                const double oa = other.u.dot(p);
+                const double ob = other.v.dot(p);
+                const int oi = static_cast<int>(
+                        std::floor(oa / other.cell_size));
+                const int oj = static_cast<int>(
+                        std::floor(ob / other.cell_size));
+                for (int di = -1; di <= 1; ++di) {
+                    for (int dj = -1; dj <= 1; ++dj) {
+                        auto itc = other.cells.find({oi + di, oj + dj});
+                        if (itc != other.cells.end() &&
+                            itc->second.points >= other.occupy_threshold) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            };
+
             bool any_snapped = false;
             for (int index : surface.boundary_vertices) {
                 Eigen::Vector3d& p = surface.mesh.vertices_[index];
                 const Eigen::Vector3d rel = p - p0;
                 const Eigen::Vector3d on_line = p0 + rel.dot(dir) * dir;
-                if ((p - on_line).norm() <= snap_dist) {
+                if ((p - on_line).norm() <= snap_dist &&
+                    near_other_cells(on_line)) {
                     p = on_line;
                     snapped.insert(index);
                     any_snapped = true;
@@ -1064,9 +1222,17 @@ inline ObjectType ClassifyPatch(const Eigen::Vector3d& normal,
 /// \p config.tile_size. Marks the claimed full-resolution points in
 /// \p claimed. Patch detection runs on a downsampled copy for speed; point
 /// membership uses the patch OBB on the full-resolution cloud.
+/// Only architectural surfaces are promoted to plane regions: horizontal
+/// patches must lie in the floor/ceiling height band (\p floor_y_hint /
+/// \p ceiling_y_hint, world y points DOWN so the floor has the largest y)
+/// and vertical patches must be wall-sized. Furniture-sized patches (sofa
+/// seats, table tops, backrests) are left unclaimed so the DBSCAN object
+/// path preserves their real shape.
 inline std::vector<RegionCandidate> PartitionPlanarTiles(
         const geometry::PointCloud& legacy,
         const SegmentationConfig& config,
+        const std::optional<double>& floor_y_hint,
+        const std::optional<double>& ceiling_y_hint,
         std::vector<bool>& claimed) {
     std::vector<RegionCandidate> tiles;
     if (!legacy.HasNormals()) {
@@ -1114,6 +1280,38 @@ inline std::vector<RegionCandidate> PartitionPlanarTiles(
         centroid /= static_cast<double>(member_indices.size());
         const ObjectType type = ClassifyPatch(normal, centroid);
         const double plane_d = -normal.dot(patch->center_);
+
+        // Architectural surface filter. Area is measured from the point
+        // count, not the OBB rectangle (which overestimates sparse patches).
+        const double patch_area =
+                EstimateSurfaceArea(member_indices.size(), config.voxel_size);
+        if (type == ObjectType::kWall) {
+            // Vertical extent of the patch box along world y.
+            const double y_extent =
+                    std::abs(patch->R_.col(0).y()) * patch->extent_(0) +
+                    std::abs(patch->R_.col(1).y()) * patch->extent_(1);
+            if (y_extent < config.min_wall_height &&
+                patch_area < config.min_patch_area_m2) {
+                continue;  // backrest-sized: leave to the object path
+            }
+        } else if (type == ObjectType::kFloor) {
+            // Furniture tops sit above the floor (smaller y with y down).
+            if (floor_y_hint) {
+                if (centroid.y() < *floor_y_hint - config.floor_band) {
+                    continue;
+                }
+            } else if (patch_area < config.min_patch_area_m2) {
+                continue;  // no floor known yet: only a large patch may seed
+            }
+        } else {  // kCeiling
+            if (ceiling_y_hint) {
+                if (centroid.y() > *ceiling_y_hint + config.floor_band) {
+                    continue;
+                }
+            } else if (patch_area < config.min_patch_area_m2) {
+                continue;
+            }
+        }
 
         // Canonical in-plane axes so tile coordinates are reproducible.
         Eigen::Vector3d u, v;
@@ -1195,9 +1393,27 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
     std::vector<bool> claimed(legacy.points_.size(), false);
 
     // 1. Planar regions (walls/floors/ceilings) as plane-local tiles.
+    // Known floor/ceiling heights from already-frozen surfaces gate which
+    // horizontal patches may become floor/ceiling (world y points down, so
+    // the floor is at the largest y).
     std::vector<RegionCandidate> candidates;
     if (config.use_planar_patches) {
-        candidates = PartitionPlanarTiles(legacy, config, claimed);
+        std::optional<double> floor_y_hint, ceiling_y_hint;
+        for (const auto& s : atlas.Snapshot()) {
+            const double ny = s.plane(1);
+            if (std::abs(ny) < 0.5) {
+                continue;
+            }
+            const double y = -s.plane(3) / ny;
+            if (s.type == ObjectType::kFloor) {
+                floor_y_hint = floor_y_hint ? std::max(*floor_y_hint, y) : y;
+            } else if (s.type == ObjectType::kCeiling) {
+                ceiling_y_hint =
+                        ceiling_y_hint ? std::min(*ceiling_y_hint, y) : y;
+            }
+        }
+        candidates = PartitionPlanarTiles(legacy, config, floor_y_hint,
+                                          ceiling_y_hint, claimed);
     }
 
     // 2. Non-planar remainder: DBSCAN object clusters (box/cylinder/generic).
@@ -1233,17 +1449,33 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
             RegionCandidate candidate;
             candidate.type = ClassifyCluster(cluster);
             if (candidate.type == ObjectType::kWall) {
-                // Estimate the plane (normal = thinnest OBB axis) so this
-                // wall joins the growing surface atlas instead of becoming
-                // a closed box.
+                // The architectural filter only guards the patch path, so a
+                // wall-like cluster must pass the same size gate before it
+                // may join the plane atlas; otherwise (e.g. a sofa backrest)
+                // it is demoted to a generic object and keeps its scanned
+                // shape via the marching-cubes mesh.
                 geometry::PointCloud cluster_legacy = cluster.ToLegacy();
                 auto obb = cluster_legacy.GetOrientedBoundingBox();
                 Eigen::Vector3d extent = obb.extent_;
                 const int thin_axis = static_cast<int>(std::distance(
                         extent.data(),
                         std::min_element(extent.data(), extent.data() + 3)));
-                const Eigen::Vector3d n = obb.R_.col(thin_axis).normalized();
-                candidate.plane << n(0), n(1), n(2), -n.dot(obb.center_);
+                double y_extent = 0.0;
+                for (int k = 0; k < 3; ++k) {
+                    if (k != thin_axis) {
+                        y_extent += std::abs(obb.R_.col(k).y()) * extent(k);
+                    }
+                }
+                const double area = EstimateSurfaceArea(
+                        cluster_legacy.points_.size(), config.voxel_size);
+                if (y_extent >= config.min_wall_height ||
+                    area >= config.min_patch_area_m2) {
+                    const Eigen::Vector3d n =
+                            obb.R_.col(thin_axis).normalized();
+                    candidate.plane << n(0), n(1), n(2), -n.dot(obb.center_);
+                } else {
+                    candidate.type = ObjectType::kGeneric;
+                }
             }
             const auto aabb = cluster.GetAxisAlignedBoundingBox().ToLegacy();
             const Eigen::Vector3d ext = aabb.GetExtent();
@@ -1311,18 +1543,19 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
         candidate.bounds =
                 candidates[c].points.GetAxisAlignedBoundingBox().ToLegacy();
 
-        if (candidate.type == ObjectType::kGeneric) {
-            candidate.mesh = model.ExtractTriangleMeshIncluding(
-                                          config.mesh_weight_threshold, -1,
-                                          candidate.block_keys)
-                                     .To(mesh_device);
-            if (!candidate.mesh.HasVertexPositions()) {
-                candidate.mesh = CreatePrimitiveMesh(
-                        ObjectType::kBox, candidates[c].points, mesh_device);
-            }
-        } else {
+        // Objects keep their real scanned shape: marching-cubes mesh from
+        // the frozen TSDF blocks. Primitive box/cylinder shapes are only a
+        // fallback (the type label is still reported in GUI/JSON).
+        candidate.mesh = model.ExtractTriangleMeshIncluding(
+                                      config.mesh_weight_threshold, -1,
+                                      candidate.block_keys)
+                                 .To(mesh_device);
+        if (!candidate.mesh.HasVertexPositions()) {
             candidate.mesh = CreatePrimitiveMesh(
-                    candidate.type, candidates[c].points, mesh_device);
+                    candidate.type == ObjectType::kGeneric
+                            ? ObjectType::kBox
+                            : candidate.type,
+                    candidates[c].points, mesh_device);
         }
         if (candidate.mesh.HasVertexPositions()) {
             frozen_now.push_back(std::move(candidate));
