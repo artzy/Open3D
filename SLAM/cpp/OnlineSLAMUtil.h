@@ -27,7 +27,7 @@ namespace online_slam {
 using namespace open3d::visualization;
 
 // Filament upload budget for live preview (extract uses estimated_points).
-static constexpr int kMaxRenderPoints = 150000;
+static constexpr int kMaxRenderPoints = 100000;
 // DBSCAN / object freeze input cap (large clouds can crash or hang).
 static constexpr int kMaxSegmentationPoints = 200000;
 
@@ -331,6 +331,7 @@ public:
             default_param["auto_freeze"] = 0;
             default_param["gui_update_interval"] = 3;
             default_param["update_interval"] = 100;
+            default_param["raycast_color"] = 0;
         }
 
         fixed_props_ = std::make_shared<PropertyPanel>(spacing, left_margin);
@@ -673,8 +674,7 @@ protected:
     bool trajectory_geometry_added_ = false;
     int64_t last_render_point_count_ = 0;
     uint64_t last_surface_version_gui_ = 0;
-    bool camera_fitted_ = false;
-    Eigen::Vector3f last_camera_center_ = Eigen::Vector3f::Zero();
+    bool camera_view_initialized_ = false;
     int consecutive_tracking_failures_ = 0;
     int consecutive_slow_frames_ = 0;
     int capture_skip_count_ = 0;
@@ -741,6 +741,37 @@ protected:
         config.dbscan_eps = prop_values_.dbscan_eps_multiplier.load() *
                               prop_values_.voxel_size.load();
         return config;
+    }
+
+    // SLAM/RGB-D world uses +Y down (camera convention). SetupCamera applies
+    // the OpenGL default (+Y up), so re-apply LookAt with -Y up afterward.
+    // Never call SetupCamera again after the first real-geometry fit or the
+    // view flips when point clouds are replaced by freeze meshes.
+    void ConfigureSlamCameraView(const geometry::AxisAlignedBoundingBox& bbox) {
+        if (bbox.IsEmpty()) {
+            return;
+        }
+        Eigen::Vector3f center = bbox.GetCenter().cast<float>();
+        widget3d_->SetupCamera(60.0f, bbox, center);
+        const float max_dim =
+                std::max(1.0f, 1.25f * static_cast<float>(bbox.GetMaxExtent()));
+        const Eigen::Vector3f eye(center.x(), center.y() - 0.2f * max_dim,
+                                  center.z() - max_dim);
+        widget3d_->LookAt(center, eye, Eigen::Vector3f(0.f, -1.f, 0.f));
+    }
+
+    void UpdateCameraCenterOfRotation(
+            const geometry::AxisAlignedBoundingBox& bbox) {
+        if (bbox.IsEmpty()) {
+            return;
+        }
+        if (!camera_view_initialized_) {
+            ConfigureSlamCameraView(bbox);
+            camera_view_initialized_ = true;
+        } else {
+            widget3d_->SetCenterOfRotation(
+                    bbox.GetCenter().cast<float>());
+        }
     }
 
     void AddFrozenMeshesToScene(
@@ -932,40 +963,16 @@ protected:
         pcd_mat.shader = "defaultUnlit";
         pcd_mat.sRGB_vertex_color = true;
 
-        // Filament UpdateGeometry only supports in-place updates when the new
-        // point count is <= the existing vertex buffer (see FilamentScene.cpp).
-        // Any growth requires RemoveGeometry + AddGeometry.
-        const bool needs_rebuild =
-                !points_geometry_added_ || last_render_point_count_ == 0 ||
-                render_count > last_render_point_count_ ||
-                render_count < last_render_point_count_ * 8 / 10;
-
-        if (needs_rebuild) {
-            if (points_geometry_added_) {
-                scene->RemoveGeometry("points");
-            }
-            scene->AddGeometry("points", render_pcd, pcd_mat);
-            points_geometry_added_ = true;
-        } else {
-            scene->UpdateGeometry("points", render_pcd,
-                                  Scene::kUpdatePointsFlag |
-                                          Scene::kUpdateColorsFlag);
+        // Filament UpdateGeometry cannot grow vertex buffers; always rebuild the
+        // preview cloud to avoid access violations in FilamentScene.cpp.
+        if (points_geometry_added_) {
+            scene->RemoveGeometry("points");
         }
+        scene->AddGeometry("points", render_pcd, pcd_mat);
+        points_geometry_added_ = true;
         last_render_point_count_ = render_count;
 
-        auto tbbox = render_pcd.GetAxisAlignedBoundingBox();
-        geometry::AxisAlignedBoundingBox bbox = tbbox.ToLegacy();
-        if (bbox.Volume() > 0) {
-            Eigen::Vector3f center = bbox.GetCenter().cast<float>();
-            const float center_shift =
-                    camera_fitted_ ? (center - last_camera_center_).norm()
-                                   : 0.0f;
-            if (!camera_fitted_ || center_shift > 0.3f) {
-                widget3d_->SetupCamera(60.0f, bbox, center);
-                last_camera_center_ = center;
-                camera_fitted_ = true;
-            }
-        }
+        UpdateCameraCenterOfRotation(render_pcd.GetAxisAlignedBoundingBox().ToLegacy());
     }
 
     void InitSlamModelOnMainThread() {
@@ -1072,6 +1079,9 @@ protected:
             return;
         }
 
+        // Allow the main thread to finish first layout/Filament init.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
         // Only set at initialization
         float depth_scale = prop_values_.depth_scale;
         core::Tensor T_frame_to_model = core::Tensor::Eye(
@@ -1158,11 +1168,10 @@ protected:
                     geometry::AxisAlignedBoundingBox bbox(
                             Eigen::Vector3d(-5, -5, -5),
                             Eigen::Vector3d(5, 5, 5));
-                    Eigen::Vector3f center = bbox.GetCenter().cast<float>();
-                    this->widget3d_->SetupCamera(60, bbox, center);
-                    this->widget3d_->LookAt(center,
-                                            center - Eigen::Vector3f{0, 1, 3},
-                                            {0.0f, -1.0f, 0.0f});
+                    // Placeholder fit for correct orientation at startup; real
+                    // geometry bbox triggers the one-time fit in
+                    // UpdateCameraCenterOfRotation().
+                    this->ConfigureSlamCameraView(bbox);
                 });
 
         Eigen::IOFormat CleanFmt(Eigen::StreamPrecision, 0, ", ", "\n", "[",
@@ -1359,9 +1368,11 @@ protected:
             const int64_t hash_size = model_->GetHashMap().Size();
             const int effective_interval = GetEffectiveUpdateInterval(
                     static_cast<int>(prop_values_.update_interval), hash_size);
+            const int first_extract_frame = exit_on_empty_frame_ ? 30 : 3;
             const bool should_request_extract =
                     prop_values_.update_surface && idx > 0 &&
-                    (idx == 3 || idx % effective_interval == 0);
+                    (idx == first_extract_frame ||
+                     idx % effective_interval == 0);
             if (should_request_extract) {
                 constexpr float kExtractWeightThreshold = 3.0f;
                 const int extract_budget = GetLiveExtractBudget(

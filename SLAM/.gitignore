@@ -1,0 +1,11 @@
+bin/
+obj/
+.vs/
+*.vcxproj.user
+*.log
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
