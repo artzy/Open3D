@@ -23,26 +23,21 @@
 #include "open3d/Open3D.h"
 #include "open3d/core/TensorFunction.h"
 #include "ObjectMeshPipeline.h"
+#include "SlamTrackingRecovery.h"
 
 namespace open3d {
 namespace examples {
 namespace online_slam {
 using namespace open3d::visualization;
+namespace st = slam_tracking;
 
 // Filament upload budget for live preview (extract uses estimated_points).
 static constexpr int kMaxRenderPoints = 500000;
 
 // Tracking tiers: only Strong frames (good fitness, small per-frame motion)
-// update the pose and integrate. Weak / failed / outlier frames are skipped
-// entirely: integrating with an uncertain pose stamps duplicate copies of
-// the scene ("ghost walls").
-static constexpr double kPoseFitnessMin = 0.25;      // Min fitness slider default
-static constexpr double kPoseTranslationMax = 0.12;  // m per frame
-static constexpr double kPoseRotationMaxDeg = 8.0;   // deg per frame
-static constexpr double kWeakFitnessMin = 0.08;
-static constexpr double kWeakTranslationMax = 0.30;
-static constexpr double kOutlierTranslation = 0.50;
-static constexpr double kOutlierRotationDeg = 25.0;
+// update the pose and integrate. Weak / failed / outlier frames skip integration;
+// frame-to-frame odometry may still bridge the pose without integrating.
+static constexpr double kPoseFitnessMin = st::kOnlineMinFitnessDefault;
 
 // Relocalization gate: after this many consecutive non-Strong frames the
 // pose is likely drifted, so integration is paused until the camera re-locks
@@ -71,12 +66,6 @@ static constexpr int kStationaryFrames = 30;
 
 // OdometryLossParams uses depth_huber_delta=0.05 by default; truncation must
 // be strictly greater to avoid Huber/L2 degeneracy warnings.
-static constexpr float kOdometryHuberDelta = 0.05f;
-float SafeOdometryDepthDiff(float depth_diff) {
-    return std::max(kOdometryHuberDelta + 0.001f, depth_diff);
-}
-
-enum class TrackingTier { kInit, kStrong, kWeak, kOutlier, kFail };
 
 // Scale GUI refresh rate when the voxel hash grows (ExtractPointCloud cost rises).
 int GetEffectiveUpdateInterval(int base_interval, int64_t hash_size) {
@@ -355,7 +344,11 @@ public:
                 {"planar_tiles", 1},
                 {"tile_size", 1.0},
                 {"show_camera", 1},
-                {"show_path", 1}};
+                {"show_path", 1},
+                {"show_source_cloud", 0},
+                {"show_plane_mesh", 1},
+                {"use_adaptive_polygons", 0},
+                {"poly_use_boundary_hull", 0}};
         /// Override values by user provided default parameters
         for (auto it : default_parameters_) {
             if (default_param.find(it.first) != default_param.end()) {
@@ -478,6 +471,30 @@ public:
                 "Show path", &prop_values_.show_path,
                 default_param.at("show_path") > 0.5,
                 "Show the camera trajectory (path) in the 3D view.");
+        adjustable_props_->AddBool(
+                "Show source cloud", &prop_values_.show_source_cloud,
+                default_param.at("show_source_cloud") > 0.5,
+                "Show original point clouds archived before plane freeze "
+                "(source_{id}).");
+        adjustable_props_->AddBool(
+                "Show plane mesh", &prop_values_.show_plane_mesh,
+                default_param.at("show_plane_mesh") > 0.5,
+                "Show frozen wall/floor/ceiling plane meshes (region_{id}). "
+                "Non-planar object meshes stay visible.");
+        adjustable_props_->AddBool(
+                "Adaptive polygons", &prop_values_.use_adaptive_polygons,
+                default_param.at("use_adaptive_polygons") > 0.5,
+                "Use adaptive quadtree polygons instead of fixed 0.25 m grid "
+                "for planar freeze meshes.");
+        adjustable_props_->AddBool(
+                "Polygon boundary hull", &prop_values_.poly_use_boundary_hull,
+                default_param.at("poly_use_boundary_hull") > 0.5,
+                "Clip adaptive polygon leaves to occupied-cell convex hull "
+                "(requires Adaptive polygons).");
+
+        adjustable_props_->SetOnChanged([this]() {
+            RefreshSceneOverlays();
+        });
 
         panel_->AddChild(std::make_shared<gui::Label>("Starting settings"));
         panel_->AddChild(fixed_props_);
@@ -517,6 +534,19 @@ public:
                                   hash_size));
         });
         panel_->AddChild(clean_button);
+        panel_->AddFixed(vspacing);
+
+        auto recover_button = std::make_shared<gui::Button>("Recover tracking");
+        recover_button->SetOnClicked([this]() {
+            if (!is_started_) {
+                return;
+            }
+            recover_tracking_requested_.store(true);
+            utility::LogInfo(
+                    "Recover tracking requested: will roll back to the last "
+                    "strong pose and enter relocalization.");
+        });
+        panel_->AddChild(recover_button);
         panel_->AddFixed(vspacing);
 
         panel_->AddStretch();
@@ -614,6 +644,35 @@ public:
                                 "      \"area_m2\": {:.3f},\n", obj.area_m2);
                         blocks_json << "      \"mesh\": \"" << mesh_path
                                     << "\"";
+                        if (obj.source_snapshot &&
+                            !obj.source_snapshot->IsEmpty()) {
+                            const std::string source_path =
+                                    "source_" + std::to_string(obj.id) +
+                                    ".ply";
+                            try {
+                                io::WritePointCloud("objects/" + source_path,
+                                                    *obj.source_snapshot);
+                            } catch (const std::exception& e) {
+                                utility::LogWarning(
+                                        "Failed to save {}: {}", source_path,
+                                        e.what());
+                            }
+                            blocks_json << ",\n      \"source_point_cloud\": "
+                                        << "\"" << source_path << "\"";
+                            blocks_json << ",\n      \"source_point_count\": "
+                                        << obj.source_snapshot->points_.size();
+                            if (obj.compare_rmse > 0.0) {
+                                blocks_json << fmt::format(
+                                        ",\n      \"compare_rmse\": {:.6f}",
+                                        obj.compare_rmse);
+                            }
+                        }
+                        if (object_mesh::IsPlanarType(obj.type)) {
+                            blocks_json << fmt::format(
+                                    ",\n      \"mesh_mode\": \"{}\",\n"
+                                    "      \"patch_count\": {}",
+                                    obj.mesh_mode, obj.patch_count);
+                        }
                         if (obj.block_keys.NumElements() > 0) {
                             blocks_json << ",\n      \"block_keys\": [";
                             core::Tensor keys =
@@ -644,12 +703,13 @@ public:
                                 "    {{\"id\": {}, \"type\": \"{}\", "
                                 "\"plane\": [{:.6f}, {:.6f}, {:.6f}, "
                                 "{:.6f}], \"cell_size\": {:.3f}, "
-                                "\"cell_count\": {}, \"closure\": {:.3f}, "
+                                "\"cell_count\": {}, \"patch_count\": {}, "
+                                "\"mesh_mode\": \"{}\", \"closure\": {:.3f}, "
                                 "\"connected\": [",
                                 s.id, object_mesh::ObjectTypeName(s.type),
                                 s.plane(0), s.plane(1), s.plane(2),
                                 s.plane(3), s.cell_size, s.cell_count,
-                                s.closure);
+                                s.patch_count, s.mesh_mode, s.closure);
                         for (size_t k = 0; k < s.connected.size(); ++k) {
                             if (k > 0) {
                                 blocks_json << ", ";
@@ -797,6 +857,10 @@ protected:
         std::atomic<double> tile_size;
         std::atomic<bool> show_camera;
         std::atomic<bool> show_path;
+        std::atomic<bool> show_source_cloud;
+        std::atomic<bool> show_plane_mesh;
+        std::atomic<bool> use_adaptive_polygons;
+        std::atomic<bool> poly_use_boundary_hull;
     } prop_values_;
 
     struct {
@@ -807,6 +871,8 @@ protected:
     std::shared_ptr<geometry::PointCloud> display_points_legacy_;
     bool points_geometry_added_ = false;
     bool trajectory_geometry_added_ = false;
+    std::shared_ptr<geometry::LineSet> cached_frustum_;
+    std::shared_ptr<geometry::LineSet> cached_trajectory_;
     int64_t last_render_point_count_ = 0;
     uint64_t last_surface_version_gui_ = 0;
     bool camera_fitted_ = false;
@@ -814,6 +880,11 @@ protected:
     // Relocalization gate state (SLAM thread only).
     bool relocalizing_ = false;
     int relocalize_strong_streak_ = 0;
+    core::Tensor last_strong_pose_;
+    bool has_last_strong_pose_ = false;
+    size_t last_strong_frame_idx_ = 0;
+    int f2f_bridge_successes_ = 0;
+    std::atomic<bool> recover_tracking_requested_{false};
     // Stationary-integration gate state (SLAM thread only).
     int stationary_frames_ = 0;
     int consecutive_slow_frames_ = 0;
@@ -849,6 +920,11 @@ protected:
         int cell_count = 0;
         double closure = 0.0;
         std::vector<int> connected;
+        std::shared_ptr<geometry::PointCloud> source_points;
+        std::shared_ptr<geometry::PointCloud> source_snapshot;
+        double compare_rmse = 0.0;
+        int patch_count = 0;
+        std::string mesh_mode = "legacy_grid";
     };
     std::vector<FrozenObjectEntry> frozen_objects_;
     std::mutex frozen_mutex_;
@@ -1102,27 +1178,119 @@ protected:
                               prop_values_.voxel_size.load();
         config.use_planar_patches = prop_values_.planar_tiles.load();
         config.tile_size = prop_values_.tile_size.load();
+        config.use_adaptive_polygons =
+                prop_values_.use_adaptive_polygons.load();
+        config.poly_use_boundary_hull =
+                prop_values_.poly_use_boundary_hull.load();
         return config;
     }
 
-    void AddFrozenMeshesToScene(
-            const std::vector<FrozenObjectEntry>& new_objects) {
+    void SyncFrozenRegionVisibility() {
         using namespace rendering;
         auto o3d_scene = widget3d_->GetScene();
         MaterialRecord mesh_mat;
         mesh_mat.shader = "defaultLit";
         mesh_mat.sRGB_vertex_color = true;
-        for (const auto& obj : new_objects) {
-            if (!obj.mesh.HasVertexPositions()) {
-                continue;
-            }
-            const std::string name =
+        MaterialRecord pcd_mat;
+        pcd_mat.shader = "defaultUnlit";
+        pcd_mat.sRGB_vertex_color = true;
+        pcd_mat.point_size = 2.0f;
+
+        const bool show_planes = prop_values_.show_plane_mesh.load();
+        const bool show_sources = prop_values_.show_source_cloud.load();
+
+        std::lock_guard<std::mutex> lock(frozen_mutex_);
+        for (const auto& obj : frozen_objects_) {
+            const std::string region_name =
                     "region_" + std::to_string(obj.id);
-            if (o3d_scene->HasGeometry(name)) {
-                o3d_scene->RemoveGeometry(name);
+            const std::string source_name =
+                    "source_" + std::to_string(obj.id);
+            const bool is_planar = object_mesh::IsPlanarType(obj.type);
+            const bool show_region = obj.mesh.HasVertexPositions() &&
+                                     (!is_planar || show_planes);
+
+            if (show_region) {
+                if (o3d_scene->HasGeometry(region_name)) {
+                    o3d_scene->RemoveGeometry(region_name);
+                }
+                o3d_scene->AddGeometry(region_name, &obj.mesh, mesh_mat, false);
+            } else if (o3d_scene->HasGeometry(region_name)) {
+                o3d_scene->RemoveGeometry(region_name);
             }
-            o3d_scene->AddGeometry(name, &obj.mesh, mesh_mat, false);
+
+            const bool show_source = show_sources && obj.source_points &&
+                                     !obj.source_points->IsEmpty();
+            if (show_source) {
+                if (o3d_scene->HasGeometry(source_name)) {
+                    o3d_scene->RemoveGeometry(source_name);
+                }
+                o3d_scene->AddGeometry(source_name, obj.source_points.get(),
+                                       pcd_mat, false);
+            } else if (o3d_scene->HasGeometry(source_name)) {
+                o3d_scene->RemoveGeometry(source_name);
+            }
         }
+    }
+
+    /// Apply show/hide toggles to the 3D scene immediately (main thread).
+    /// Uses the latest cached frustum/trajectory from the SLAM loop.
+    void RefreshSceneOverlays() {
+        using namespace rendering;
+        auto o3d_scene = widget3d_->GetScene();
+        MaterialRecord line_mat;
+        line_mat.shader = "unlitLine";
+        line_mat.line_width = 5.0f;
+
+        o3d_scene->RemoveGeometry("frustum");
+        if (prop_values_.show_camera.load() && cached_frustum_) {
+            o3d_scene->AddGeometry("frustum", cached_frustum_.get(), line_mat);
+        }
+
+        if (!prop_values_.show_path.load()) {
+            if (trajectory_geometry_added_) {
+                o3d_scene->RemoveGeometry("trajectory");
+                trajectory_geometry_added_ = false;
+            }
+        } else if (cached_trajectory_ &&
+                   cached_trajectory_->points_.size() > 1) {
+            if (trajectory_geometry_added_) {
+                o3d_scene->RemoveGeometry("trajectory");
+            }
+            o3d_scene->AddGeometry("trajectory", cached_trajectory_.get(),
+                                   line_mat);
+            trajectory_geometry_added_ = true;
+        } else if (trajectory_geometry_added_) {
+            o3d_scene->RemoveGeometry("trajectory");
+            trajectory_geometry_added_ = false;
+        }
+
+        SyncFrozenRegionVisibility();
+
+        MaterialRecord pcd_mat;
+        pcd_mat.shader = "defaultUnlit";
+        pcd_mat.sRGB_vertex_color = true;
+        if (prop_values_.show_source_cloud.load()) {
+            if (points_geometry_added_) {
+                o3d_scene->RemoveGeometry("points");
+                points_geometry_added_ = false;
+            }
+        } else if (display_points_legacy_ &&
+                   display_points_legacy_->HasPoints()) {
+            if (points_geometry_added_) {
+                o3d_scene->RemoveGeometry("points");
+            }
+            o3d_scene->AddGeometry("points", display_points_legacy_.get(),
+                                   pcd_mat, false);
+            points_geometry_added_ = true;
+        }
+
+        widget3d_->ForceRedraw();
+        PostRedraw();
+    }
+
+    void AddFrozenMeshesToScene(
+            const std::vector<FrozenObjectEntry>& /*new_objects*/) {
+        SyncFrozenRegionVisibility();
     }
 
     void SegmentationWorker() {
@@ -1170,6 +1338,11 @@ protected:
                         entry.cell_count = candidate.cell_count;
                         entry.closure = candidate.closure;
                         entry.connected = candidate.connected;
+                        entry.source_points = candidate.source_points;
+                        entry.source_snapshot = candidate.source_snapshot;
+                        entry.compare_rmse = candidate.compare_rmse;
+                        entry.patch_count = candidate.patch_count;
+                        entry.mesh_mode = candidate.mesh_mode;
                         new_objects.push_back(std::move(entry));
                     }
                 }
@@ -1306,10 +1479,13 @@ protected:
                 std::make_shared<geometry::PointCloud>(render_pcd.ToLegacy());
         if (points_geometry_added_) {
             o3d_scene->RemoveGeometry("points");
+            points_geometry_added_ = false;
         }
-        o3d_scene->AddGeometry("points", display_points_legacy_.get(), pcd_mat,
-                               false);
-        points_geometry_added_ = true;
+        if (!prop_values_.show_source_cloud.load()) {
+            o3d_scene->AddGeometry("points", display_points_legacy_.get(),
+                                     pcd_mat, false);
+            points_geometry_added_ = true;
+        }
         last_render_point_count_ = render_count;
 
         auto tbbox = render_pcd.GetAxisAlignedBoundingBox();
@@ -1454,6 +1630,10 @@ protected:
         float depth_scale = prop_values_.depth_scale;
         core::Tensor T_frame_to_model = core::Tensor::Eye(
                 4, core::Dtype::Float64, core::Device("CPU:0"));
+        const core::Tensor identity_pose =
+                core::Tensor::Eye(4, core::Dtype::Float64, core::Device("CPU:0"));
+        t::geometry::RGBDImage prev_rgbd_input;
+        bool has_prev_rgbd = false;
 
         t::geometry::RGBDImage ref_rgbd_cpu = CaptureInputFrame(0);
         if (ref_rgbd_cpu.IsEmpty()) {
@@ -1573,49 +1753,30 @@ protected:
                     static_cast<int64_t>(hash_capacity * kHashIntegrateFillRatio);
 
             bool tracking_success = true;
-            TrackingTier tracking_tier = TrackingTier::kInit;
+            st::TrackingTier tracking_tier = st::TrackingTier::kInit;
             double track_fitness = 1.0;
             double track_translation = 0.0;
             double track_rotation_deg = 0.0;
             if (idx > 0 && !hash_near_full) {
+                if (recover_tracking_requested_.exchange(false)) {
+                    if (has_last_strong_pose_) {
+                        T_frame_to_model = last_strong_pose_.Clone();
+                        relocalizing_ = true;
+                        relocalize_strong_streak_ = 0;
+                        consecutive_tracking_failures_ = 0;
+                        utility::LogInfo(
+                                "Recover tracking: rolled back to last strong "
+                                "pose (frame {}).",
+                                last_strong_frame_idx_);
+                    } else {
+                        utility::LogWarning(
+                                "Recover tracking: no strong pose snapshot "
+                                "yet.");
+                    }
+                }
+
                 const double min_fitness = std::max(
-                        kWeakFitnessMin, prop_values_.min_fitness.load());
-                auto classify_tracking =
-                        [min_fitness](double fitness, double translation,
-                                      double rotation_deg) -> TrackingTier {
-                    if (translation >= kOutlierTranslation ||
-                        rotation_deg >= kOutlierRotationDeg) {
-                        return TrackingTier::kOutlier;
-                    }
-                    if (fitness >= min_fitness &&
-                        translation < kPoseTranslationMax &&
-                        rotation_deg < kPoseRotationMaxDeg) {
-                        return TrackingTier::kStrong;
-                    }
-                    if (fitness >= kWeakFitnessMin &&
-                        translation < kWeakTranslationMax) {
-                        return TrackingTier::kWeak;
-                    }
-                    return TrackingTier::kFail;
-                };
-                // Per-frame motion magnitude from the odometry delta.
-                auto measure_motion = [](const core::Tensor& transformation,
-                                         double& translation,
-                                         double& rotation_deg) {
-                    core::Tensor T_cpu =
-                            transformation
-                                    .To(core::Device("CPU:0"), core::Float64)
-                                    .Contiguous();
-                    const double* t_ptr = T_cpu.GetDataPtr<double>();
-                    translation = std::sqrt(t_ptr[3] * t_ptr[3] +
-                                            t_ptr[7] * t_ptr[7] +
-                                            t_ptr[11] * t_ptr[11]);
-                    const double trace = t_ptr[0] + t_ptr[5] + t_ptr[10];
-                    const double cos_angle = std::max(
-                            -1.0, std::min(1.0, 0.5 * (trace - 1.0)));
-                    rotation_deg = std::acos(cos_angle) *
-                                   (180.0 / 3.14159265358979323846);
-                };
+                        st::kWeakFitnessMin, prop_values_.min_fitness.load());
 
                 try {
                     const auto criteria = BuildOdometryCriteria();
@@ -1624,7 +1785,7 @@ protected:
                                 return model_->TrackFrameToModel(
                                         input_frame, raycast_frame, depth_scale,
                                         prop_values_.depth_max,
-                                        SafeOdometryDepthDiff(depth_diff),
+                                        st::SafeOdometryDepthDiff(depth_diff),
                                         t::pipelines::odometry::Method::PointToPlane,
                                         criteria);
                             };
@@ -1632,39 +1793,42 @@ protected:
                     std::lock_guard<std::mutex> model_lock(model_mutex_);
                     auto result = run_tracking(
                             static_cast<float>(prop_values_.depth_diff));
-                    measure_motion(result.transformation_, track_translation,
-                                   track_rotation_deg);
+                    st::MeasureMotion(result.transformation_, track_translation,
+                                      track_rotation_deg);
                     track_fitness = result.fitness_;
-                    tracking_tier = classify_tracking(track_fitness,
-                                                      track_translation,
-                                                      track_rotation_deg);
+                    tracking_tier = st::ClassifyTrackingOnline(
+                            track_fitness, track_translation, track_rotation_deg,
+                            min_fitness);
 
-                    if (tracking_tier == TrackingTier::kFail &&
-                        track_fitness < kWeakFitnessMin) {
+                    if (tracking_tier == st::TrackingTier::kFail &&
+                        track_fitness < st::kWeakFitnessMin) {
                         result = run_tracking(static_cast<float>(
                                 prop_values_.depth_diff * 2.0));
-                        measure_motion(result.transformation_,
-                                       track_translation, track_rotation_deg);
+                        st::MeasureMotion(result.transformation_,
+                                          track_translation, track_rotation_deg);
                         track_fitness = result.fitness_;
-                        tracking_tier = classify_tracking(track_fitness,
-                                                          track_translation,
-                                                          track_rotation_deg);
+                        tracking_tier = st::ClassifyTrackingOnline(
+                                track_fitness, track_translation,
+                                track_rotation_deg, min_fitness);
                     }
 
-                    if (tracking_tier == TrackingTier::kStrong) {
+                    if (tracking_tier == st::TrackingTier::kStrong) {
                         // Strong frames always update the pose so the raycast
                         // follows the camera (also during relocalization).
                         T_frame_to_model =
                                 T_frame_to_model.Matmul(result.transformation_);
+                        last_strong_pose_ = T_frame_to_model.Clone();
+                        has_last_strong_pose_ = true;
+                        last_strong_frame_idx_ = idx;
                     }
                 } catch (const std::exception& e) {
-                    tracking_tier = TrackingTier::kFail;
+                    tracking_tier = st::TrackingTier::kFail;
                     utility::LogWarning(
                             "Tracking exception for frame {}: {}", idx,
                             e.what());
                 }
 
-                if (tracking_tier == TrackingTier::kStrong) {
+                if (tracking_tier == st::TrackingTier::kStrong) {
                     consecutive_tracking_failures_ = 0;
                     if (relocalizing_) {
                         // Integration stays paused until enough consecutive
@@ -1686,12 +1850,12 @@ protected:
                         tracking_success = true;
                     }
                 } else {
-                    // Weak / failed / outlier: never integrate and never move
-                    // the pose; a wrong pose would stamp a duplicate surface.
+                    // Weak / failed / outlier: never integrate; pose may be
+                    // bridged via frame-to-frame odometry below.
                     tracking_success = false;
                     relocalize_strong_streak_ = 0;
                     ++consecutive_tracking_failures_;
-                    if (tracking_tier == TrackingTier::kWeak) {
+                    if (tracking_tier == st::TrackingTier::kWeak) {
                         utility::LogDebug(
                                 "Weak tracking frame {}: fitness {:.3f}, "
                                 "translation {:.3f} m, rotation {:.1f} deg. "
@@ -1700,7 +1864,7 @@ protected:
                                 track_rotation_deg);
                     } else {
                         const char* tier_name =
-                                tracking_tier == TrackingTier::kOutlier
+                                tracking_tier == st::TrackingTier::kOutlier
                                         ? "outlier"
                                         : "failed";
                         utility::LogWarning(
@@ -1721,16 +1885,75 @@ protected:
                                 consecutive_tracking_failures_,
                                 kRelocalizeStrongFrames);
                     }
+
+                    if (st::ShouldAttemptFrameToFrameBridge(tracking_tier,
+                                                            relocalizing_) &&
+                        has_prev_rgbd) {
+                        try {
+                            auto f2f_result =
+                                    t::pipelines::odometry::RGBDOdometryMultiScale(
+                                            rgbd_input, prev_rgbd_input,
+                                            intrinsic_, identity_pose,
+                                            depth_scale,
+                                            prop_values_.depth_max,
+                                            BuildOdometryCriteria(),
+                                            t::pipelines::odometry::Method::
+                                                    PointToPlane,
+                                            t::pipelines::odometry::
+                                                    OdometryLossParams(
+                                                            st::SafeOdometryDepthDiff(
+                                                                    static_cast<
+                                                                            float>(
+                                                                            prop_values_
+                                                                                    .depth_diff
+                                                                                    .load()))));
+                            const double f2f_fitness = f2f_result.fitness_;
+                            double f2f_translation = 0.0;
+                            double f2f_rotation_deg = 0.0;
+                            st::MeasureMotion(f2f_result.transformation_,
+                                              f2f_translation,
+                                              f2f_rotation_deg);
+                            bool f2f_accepted = false;
+                            if (tracking_tier == st::TrackingTier::kOutlier &&
+                                relocalizing_) {
+                                f2f_accepted =
+                                        st::FrameToFrameBridgeAcceptedRelocalizing(
+                                                f2f_fitness, f2f_translation,
+                                                f2f_rotation_deg);
+                            } else {
+                                f2f_accepted = st::FrameToFrameBridgeAccepted(
+                                        f2f_fitness, f2f_translation);
+                            }
+                            if (f2f_accepted) {
+                                T_frame_to_model = T_frame_to_model.Matmul(
+                                        f2f_result.transformation_);
+                                ++f2f_bridge_successes_;
+                                utility::LogDebug(
+                                        "Frame-to-frame bridge frame {}: "
+                                        "fitness {:.3f}, translation {:.3f} m, "
+                                        "rotation {:.1f} deg.",
+                                        idx, f2f_fitness, f2f_translation,
+                                        f2f_rotation_deg);
+                            }
+                        } catch (const std::exception& f2f_e) {
+                            if (!st::IsOdometrySingularError(f2f_e)) {
+                                utility::LogWarning(
+                                        "Frame-to-frame odometry failed at "
+                                        "frame {}: {}",
+                                        idx, f2f_e.what());
+                            }
+                        }
+                    }
                 }
             } else if (idx > 0 && hash_near_full) {
                 tracking_success = false;
-                tracking_tier = TrackingTier::kFail;
+                tracking_tier = st::TrackingTier::kFail;
             }
 
             // Stationary gate: with the camera still, voxel weights are
             // already saturated, so further integration only wastes GPU time
             // and lets depth noise allocate new blocks.
-            if (tracking_tier == TrackingTier::kStrong && !relocalizing_ &&
+            if (tracking_tier == st::TrackingTier::kStrong && !relocalizing_ &&
                 track_translation < kStationaryTranslationMax &&
                 track_rotation_deg < kStationaryRotationMaxDeg) {
                 ++stationary_frames_;
@@ -1753,7 +1976,7 @@ protected:
                     const int carve_interval = device_.IsCUDA()
                                                        ? kCarveIntervalCuda
                                                        : kCarveIntervalCpu;
-                    if (tracking_tier == TrackingTier::kStrong &&
+                    if (tracking_tier == st::TrackingTier::kStrong &&
                         idx % carve_interval == 0) {
                         try {
                             utility::Timer carve_timer;
@@ -1848,6 +2071,20 @@ protected:
                 if (hash_near_full) {
                     info << "Hash map nearly full: integration paused.\n";
                 }
+                info << fmt::format(
+                        "Tracking: {} | fitness {:.3f} | trans {:.3f} m | "
+                        "rot {:.1f} deg\n",
+                        st::TrackingTierName(tracking_tier), track_fitness,
+                        track_translation, track_rotation_deg);
+                if (f2f_bridge_successes_ > 0) {
+                    info << fmt::format("F2F pose bridges: {}\n",
+                                        f2f_bridge_successes_);
+                }
+                if (tracking_tier == st::TrackingTier::kOutlier ||
+                    tracking_tier == st::TrackingTier::kFail) {
+                    info << "Integration paused. Move slowly to the scanned "
+                            "area, or click Recover tracking.\n";
+                }
                 if (integration_idle) {
                     info << "Integration idle (camera stationary).\n";
                 }
@@ -1884,6 +2121,36 @@ protected:
                     if (frozen_regions > 0) {
                         info << fmt::format("Frozen regions: {}\n",
                                             frozen_regions);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(frozen_mutex_);
+                        size_t lines = 0;
+                        for (const auto& obj : frozen_objects_) {
+                            if (!obj.source_points && obj.compare_rmse <= 0.0) {
+                                continue;
+                            }
+                            if (lines >= 8) {
+                                info << fmt::format("  ... {} more frozen\n",
+                                                    frozen_objects_.size() -
+                                                            lines);
+                                break;
+                            }
+                            const size_t snapshot_pts =
+                                    obj.source_snapshot
+                                            ? obj.source_snapshot->points_.size()
+                                            : (obj.source_points
+                                                       ? obj.source_points
+                                                                 ->points_.size()
+                                                       : 0);
+                            info << fmt::format(
+                                    "  #{} {:<8} {:>5.1f} m2  {}  patches "
+                                    "{:<4}  rmse {:>4.1f} mm  ({} pts)\n",
+                                    obj.id,
+                                    object_mesh::ObjectTypeName(obj.type),
+                                    obj.area_m2, obj.mesh_mode, obj.patch_count,
+                                    obj.compare_rmse * 1000.0, snapshot_pts);
+                            ++lines;
+                        }
                     }
                 }
                 info << "\n";
@@ -1978,31 +2245,13 @@ protected:
                                     post_raycast_depth_colored);
                         }
 
-                        this->widget3d_->GetScene()->RemoveGeometry("frustum");
-                        auto mat = rendering::MaterialRecord();
-                        mat.shader = "unlitLine";
-                        mat.line_width = 5.0f;
-                        if (post_frustum &&
-                            this->prop_values_.show_camera.load()) {
-                            this->widget3d_->GetScene()->AddGeometry(
-                                    "frustum", post_frustum.get(), mat);
+                        if (post_frustum) {
+                            this->cached_frustum_ = post_frustum;
                         }
-
-                        if (!this->prop_values_.show_path.load()) {
-                            if (trajectory_geometry_added_) {
-                                this->widget3d_->GetScene()->RemoveGeometry(
-                                        "trajectory");
-                                trajectory_geometry_added_ = false;
-                            }
-                        } else if (post_traj && post_traj->points_.size() > 1) {
-                            if (trajectory_geometry_added_) {
-                                this->widget3d_->GetScene()->RemoveGeometry(
-                                        "trajectory");
-                            }
-                            this->widget3d_->GetScene()->AddGeometry(
-                                    "trajectory", post_traj.get(), mat);
-                            trajectory_geometry_added_ = true;
+                        if (post_traj) {
+                            this->cached_trajectory_ = post_traj;
                         }
+                        this->RefreshSceneOverlays();
 
                         t::geometry::PointCloud surface_pcd;
                         {
@@ -2025,6 +2274,13 @@ protected:
 
             // Note that the user might have closed the window, in which case we
             // want to maintain a value of true.
+            prev_rgbd_input = rgbd_input;
+            has_prev_rgbd = true;
+            if (idx == 0) {
+                last_strong_pose_ = T_frame_to_model.Clone();
+                has_last_strong_pose_ = true;
+                last_strong_frame_idx_ = 0;
+            }
             idx++;
             } catch (const std::exception& e) {
                 utility::LogWarning("Frame {} processing failed: {}", idx,

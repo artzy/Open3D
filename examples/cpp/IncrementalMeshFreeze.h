@@ -46,7 +46,14 @@ struct FrozenMeshEntry {
     int cell_count = 0;
     double closure = 0.0;
     std::vector<int> connected;
+    double compare_rmse = 0.0;
+    int patch_count = 0;
+    std::string mesh_mode = "legacy_grid";
 };
+
+inline std::string FrozenSourcePointCloudFileName(int id) {
+    return "source_" + std::to_string(id) + ".ply";
+}
 
 inline std::string FrozenMeshFileName(const FrozenMeshEntry& entry) {
     return (object_mesh::IsPlanarType(entry.type) ? "surface_" : "object_") +
@@ -96,6 +103,7 @@ public:
                 next_object_id_);
 
         const geometry::PointCloud surface_legacy = surface_pcd.ToLegacy();
+        (void)surface_legacy;
 
         for (auto& candidate : candidates) {
             if (!candidate.mesh.HasVertexPositions()) {
@@ -115,14 +123,15 @@ public:
             entry.cell_count = candidate.cell_count;
             entry.closure = candidate.closure;
             entry.connected = candidate.connected;
+            entry.compare_rmse = candidate.compare_rmse;
+            entry.patch_count = candidate.patch_count;
+            entry.mesh_mode = candidate.mesh_mode;
 
-            if (config_.save_point_cloud_snapshot &&
-                candidate.bounds.Volume() > 0.0) {
-                std::shared_ptr<geometry::PointCloud> cropped =
-                        surface_legacy.Crop(candidate.bounds);
-                if (cropped && !cropped->IsEmpty()) {
-                    ClampPcdColors(*cropped);
-                    entry.snapshot_pcd = cropped;
+            if (config_.save_point_cloud_snapshot) {
+                if (candidate.source_snapshot) {
+                    entry.snapshot_pcd = candidate.source_snapshot;
+                } else if (candidate.source_points) {
+                    entry.snapshot_pcd = candidate.source_points;
                 }
             }
 
@@ -183,7 +192,7 @@ public:
             const auto& obj = all_frozen_[i];
             const std::string mesh_path = FrozenMeshFileName(obj);
             const std::string pcd_path =
-                    "pcd_" + std::to_string(obj.id) + ".ply";
+                    FrozenSourcePointCloudFileName(obj.id);
 
             blocks_json << "    {\n";
             blocks_json << "      \"id\": " << obj.id << ",\n";
@@ -201,8 +210,21 @@ public:
                                        obj.area_m2);
             blocks_json << "      \"mesh\": \"" << mesh_path << "\"";
             if (obj.snapshot_pcd) {
-                blocks_json << ",\n      \"point_cloud\": \"" << pcd_path
-                            << "\"";
+                blocks_json << ",\n      \"source_point_cloud\": \""
+                            << pcd_path << "\"";
+                blocks_json << ",\n      \"source_point_count\": "
+                            << obj.snapshot_pcd->points_.size();
+                if (obj.compare_rmse > 0.0) {
+                    blocks_json << fmt::format(
+                            ",\n      \"compare_rmse\": {:.6f}",
+                            obj.compare_rmse);
+                }
+            }
+            if (object_mesh::IsPlanarType(obj.type)) {
+                blocks_json << fmt::format(
+                        ",\n      \"mesh_mode\": \"{}\",\n"
+                        "      \"patch_count\": {}",
+                        obj.mesh_mode, obj.patch_count);
             }
             if (obj.block_keys.NumElements() > 0) {
                 blocks_json << ",\n      \"block_keys\": [";
@@ -232,11 +254,12 @@ public:
             blocks_json << fmt::format(
                     "    {{\"id\": {}, \"type\": \"{}\", \"plane\": "
                     "[{:.6f}, {:.6f}, {:.6f}, {:.6f}], \"cell_size\": "
-                    "{:.3f}, \"cell_count\": {}, \"closure\": {:.3f}, "
+                    "{:.3f}, \"cell_count\": {}, \"patch_count\": {}, "
+                    "\"mesh_mode\": \"{}\", \"closure\": {:.3f}, "
                     "\"connected\": [",
                     s.id, object_mesh::ObjectTypeName(s.type), s.plane(0),
                     s.plane(1), s.plane(2), s.plane(3), s.cell_size,
-                    s.cell_count, s.closure);
+                    s.cell_count, s.patch_count, s.mesh_mode, s.closure);
             for (size_t k = 0; k < s.connected.size(); ++k) {
                 if (k > 0) {
                     blocks_json << ", ";
@@ -283,10 +306,13 @@ private:
         }
 
         if (entry.snapshot_pcd) {
-            const std::string pcd_path = config_.output_dir + "/pcd_" +
-                                         std::to_string(entry.id) + ".ply";
+            const std::string pcd_path =
+                    config_.output_dir + "/" +
+                    FrozenSourcePointCloudFileName(entry.id);
             try {
-                io::WritePointCloud(pcd_path, *entry.snapshot_pcd);
+                geometry::PointCloud pcd = *entry.snapshot_pcd;
+                ClampPcdColors(pcd);
+                io::WritePointCloud(pcd_path, pcd);
             } catch (const std::exception& e) {
                 utility::LogWarning("Failed to save {}: {}", pcd_path, e.what());
             }

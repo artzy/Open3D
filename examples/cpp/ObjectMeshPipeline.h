@@ -19,6 +19,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -33,6 +34,7 @@
 #include "open3d/Open3D.h"
 #include "open3d/core/TensorFunction.h"
 #include "open3d/t/pipelines/slam/Model.h"
+#include "PlanarPolygonMesher.h"
 
 namespace open3d {
 namespace examples {
@@ -110,6 +112,17 @@ struct SegmentationConfig {
     double min_wall_height = 1.2;      // min vertical extent of a wall (m)
     double min_patch_area_m2 = 1.5;    // min area for floor/ceiling seeds
     double floor_band = 0.15;          // height band around floor/ceiling (m)
+    // Source point archive when a region is replaced by a plane/mesh.
+    bool save_source_points = true;
+    double source_pcd_downsample = 2.0;  // voxel multiplier for snapshots
+    // Adaptive quadtree polygon mesher (default off: legacy fixed grid).
+    bool use_adaptive_polygons = false;
+    double poly_min_edge = 0.0;  // 0 => 2 * voxel_size
+    double poly_max_edge = 0.0;   // 0 => cell_size
+    double poly_max_plane_error = 0.0;  // 0 => 0.5 * surface_merge_dist
+    int poly_max_leaf_count = 5000;
+    bool poly_use_boundary_hull = false;
+    double poly_hull_alpha = 0.012;
 };
 
 /// One partitioned region candidate produced from a single extracted surface:
@@ -139,6 +152,13 @@ struct FrozenObjectCandidate {
     int cell_count = 0;
     double closure = 0.0;
     std::vector<int> connected;
+    // Points observed before plane/mesh replacement (downsampled snapshot).
+    std::shared_ptr<geometry::PointCloud> source_snapshot;
+    // GUI overlay (dense grid for planar); defaults to snapshot for objects.
+    std::shared_ptr<geometry::PointCloud> source_points;
+    double compare_rmse = 0.0;  // m, plane or mesh fit error at freeze
+    int patch_count = 0;
+    std::string mesh_mode = "legacy_grid";
 };
 
 // ---------------------------------------------------------------------------
@@ -519,6 +539,105 @@ inline bool PassesArchitecturalWallFilter(double y_span,
     return patch_area >= config.min_patch_area_m2 * kMinWallAreaFraction;
 }
 
+/// Downsampled copy for GUI display and disk snapshots.
+inline geometry::PointCloud PrepareSourceSnapshot(
+        const geometry::PointCloud& cloud, const SegmentationConfig& config) {
+    if (cloud.points_.empty()) {
+        return cloud;
+    }
+    const double vs =
+            std::max(1e-4, static_cast<double>(config.voxel_size) *
+                                   config.source_pcd_downsample);
+    auto down = cloud.VoxelDownSample(vs);
+    return down ? *down : cloud;
+}
+
+/// Project each point onto the plane so overlay comparison aligns with the
+/// open quad mesh (removes TSDF truncation-band offset along the normal).
+inline geometry::PointCloud ProjectPointsOntoPlane(
+        const geometry::PointCloud& cloud, const Eigen::Vector4d& plane) {
+    geometry::PointCloud out;
+    if (cloud.points_.empty() || plane.head<3>().norm() < 1e-9) {
+        return out;
+    }
+    Eigen::Vector4d p = plane;
+    p /= p.head<3>().norm();
+    const Eigen::Vector3d n = p.head<3>();
+    const bool has_colors = cloud.colors_.size() == cloud.points_.size();
+    out.points_.reserve(cloud.points_.size());
+    if (has_colors) {
+        out.colors_.reserve(cloud.colors_.size());
+    }
+    for (size_t k = 0; k < cloud.points_.size(); ++k) {
+        const Eigen::Vector3d& pt = cloud.points_[k];
+        const double d = n.dot(pt) + p(3);
+        out.points_.push_back(pt - d * n);
+        if (has_colors) {
+            out.colors_.push_back(cloud.colors_[k]);
+        }
+    }
+    return out;
+}
+
+inline double ComputePlanarRmse(const geometry::PointCloud& points,
+                                const Eigen::Vector4d& plane) {
+    if (points.points_.empty() || plane.head<3>().norm() < 1e-9) {
+        return 0.0;
+    }
+    Eigen::Vector4d p = plane;
+    p /= p.head<3>().norm();
+    const Eigen::Vector3d n = p.head<3>();
+    double sum_sq = 0.0;
+    for (const auto& pt : points.points_) {
+        const double d = n.dot(pt) + p(3);
+        sum_sq += d * d;
+    }
+    return std::sqrt(sum_sq / static_cast<double>(points.points_.size()));
+}
+
+inline double ComputeMeshRmse(const geometry::PointCloud& points,
+                              const geometry::TriangleMesh& mesh) {
+    if (points.points_.empty() || mesh.vertices_.empty()) {
+        return 0.0;
+    }
+    geometry::PointCloud target;
+    target.points_ = mesh.vertices_;
+    geometry::PointCloud query = points;
+    const std::vector<double> dists = query.ComputePointCloudDistance(target);
+    if (dists.empty()) {
+        return 0.0;
+    }
+    double sum_sq = 0.0;
+    for (double d : dists) {
+        sum_sq += d * d;
+    }
+    return std::sqrt(sum_sq / static_cast<double>(dists.size()));
+}
+
+inline void AttachSourceSnapshot(FrozenObjectCandidate& candidate,
+                                 const geometry::PointCloud& raw_points,
+                                 const SegmentationConfig& config) {
+    if (!config.save_source_points || raw_points.points_.empty()) {
+        return;
+    }
+    geometry::PointCloud aligned = raw_points;
+    if (IsPlanarType(candidate.type) &&
+        candidate.plane.head<3>().norm() > 1e-9) {
+        aligned = ProjectPointsOntoPlane(raw_points, candidate.plane);
+    }
+    geometry::PointCloud snapshot = PrepareSourceSnapshot(aligned, config);
+    candidate.source_snapshot =
+            std::make_shared<geometry::PointCloud>(std::move(snapshot));
+    candidate.source_points = candidate.source_snapshot;
+    if (candidate.mesh.HasVertexPositions()) {
+        candidate.compare_rmse =
+                ComputeMeshRmse(aligned, candidate.mesh.ToLegacy());
+    } else if (IsPlanarType(candidate.type) &&
+               candidate.plane.head<3>().norm() > 1e-9) {
+        candidate.compare_rmse = ComputePlanarRmse(aligned, candidate.plane);
+    }
+}
+
 /// Canonical in-plane axes derived only from the normal and anchored to the
 /// world axes, so cell coordinates are reproducible across frames.
 inline void CanonicalPlaneAxes(const Eigen::Vector3d& normal,
@@ -536,6 +655,28 @@ inline void CanonicalPlaneAxes(const Eigen::Vector3d& normal,
     v = normal.cross(u);
 }
 
+inline planar_polygon::AdaptiveMeshParams MakeAdaptiveMeshParams(
+        const SegmentationConfig& config, double cell_size) {
+    planar_polygon::AdaptiveMeshParams params;
+    params.voxel_size = config.voxel_size;
+    params.min_cell_points = config.min_cell_points;
+    params.min_cell_coverage = config.min_cell_coverage;
+    params.poly_min_edge =
+            config.poly_min_edge > 0.0
+                    ? config.poly_min_edge
+                    : 2.0 * static_cast<double>(config.voxel_size);
+    params.poly_max_edge = config.poly_max_edge > 0.0 ? config.poly_max_edge
+                                                      : cell_size;
+    params.poly_max_plane_error =
+            config.poly_max_plane_error > 0.0
+                    ? config.poly_max_plane_error
+                    : 0.5 * config.surface_merge_dist;
+    params.poly_max_leaf_count = config.poly_max_leaf_count;
+    params.poly_use_boundary_hull = config.poly_use_boundary_hull;
+    params.poly_hull_alpha = config.poly_hull_alpha;
+    return params;
+}
+
 class PlaneSurfaceAtlas {
 public:
     struct SurfaceInfo {
@@ -548,6 +689,8 @@ public:
         double closure = 0.0;  // snapped boundary corner ratio [0, 1]
         std::vector<int> connected;
         core::Tensor block_keys;  // union of frozen tile keys (CPU Int32)
+        int patch_count = 0;
+        std::string mesh_mode = "legacy_grid";
     };
 
     /// Accumulate a frozen planar tile into a matching surface (coplanar
@@ -621,6 +764,10 @@ public:
             if (std::abs(n.dot(p) + surface->plane(3)) > max_plane_dist) {
                 continue;
             }
+            surface->source_archive.points_.push_back(p);
+            if (has_colors) {
+                surface->source_archive.colors_.push_back(points.colors_[k]);
+            }
             const double a = surface->u.dot(p);
             const double b = surface->v.dot(p);
             const int ci = static_cast<int>(
@@ -679,8 +826,13 @@ public:
             if (surface == nullptr) {
                 continue;
             }
-            BuildSurfaceMesh(*surface, config);
+            if (config.use_adaptive_polygons) {
+                BuildAdaptivePatchMesh(*surface, config);
+            } else {
+                BuildSurfaceMesh(*surface, config);
+            }
             SnapToNeighbors(*surface, config);
+            RepositionVerticesOnPlane(*surface);
             surface->mesh.ComputeVertexNormals();
             updated.push_back(id);
         }
@@ -698,6 +850,143 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         const Surface* surface = FindSurface(id);
         return surface ? MakeInfo(*surface) : SurfaceInfo();
+    }
+
+    /// Full-resolution points accumulated before plane replacement.
+    geometry::PointCloud GetSourcePoints(int id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Surface* surface = FindSurface(id);
+        return surface ? surface->source_archive : geometry::PointCloud();
+    }
+
+    /// Source points restricted to mesh-rendered cells (same coverage gate
+    /// as BuildSurfaceMesh) for aligned overlay comparison.
+    geometry::PointCloud GetMeshAlignedSourcePoints(
+            int id, const SegmentationConfig& config) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Surface* surface = FindSurface(id);
+        if (!surface || surface->source_archive.points_.empty()) {
+            return {};
+        }
+        const int occupy_threshold = surface->occupy_threshold;
+        if (occupy_threshold == std::numeric_limits<int>::max()) {
+            return {};
+        }
+        (void)config;
+        geometry::PointCloud aligned;
+        const Eigen::Vector3d n = surface->plane.head<3>();
+        const bool has_colors =
+                surface->source_archive.colors_.size() ==
+                surface->source_archive.points_.size();
+
+        auto point_in_adaptive_leaf = [&](double u, double v) -> bool {
+            for (const auto& leaf : surface->patches) {
+                if (u >= leaf.min_u && u <= leaf.max_u && v >= leaf.min_v &&
+                    v <= leaf.max_v) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        for (size_t k = 0; k < surface->source_archive.points_.size(); ++k) {
+            const Eigen::Vector3d& pt = surface->source_archive.points_[k];
+            const double u = surface->u.dot(pt);
+            const double v = surface->v.dot(pt);
+
+            if (surface->adaptive_mesh && !surface->patches.empty()) {
+                if (!point_in_adaptive_leaf(u, v)) {
+                    continue;
+                }
+            } else {
+                const int ci = static_cast<int>(
+                        std::floor(u / surface->cell_size));
+                const int cj = static_cast<int>(
+                        std::floor(v / surface->cell_size));
+                auto it = surface->cells.find({ci, cj});
+                if (it == surface->cells.end() ||
+                    it->second.points < occupy_threshold) {
+                    continue;
+                }
+            }
+
+            const double d = n.dot(pt) + surface->plane(3);
+            aligned.points_.push_back(pt - d * n);
+            if (has_colors) {
+                aligned.colors_.push_back(surface->source_archive.colors_[k]);
+            }
+        }
+        return aligned;
+    }
+
+    int GetPatchCount(int id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Surface* surface = FindSurface(id);
+        return surface ? static_cast<int>(surface->patches.size()) : 0;
+    }
+
+    std::string GetMeshMode(int id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Surface* surface = FindSurface(id);
+        return surface ? surface->mesh_mode : std::string("legacy_grid");
+    }
+
+    /// Dense in-plane grid per rendered leaf (adaptive patches or legacy cells).
+    geometry::PointCloud BuildDenseCellSourceOverlay(
+            int id, const SegmentationConfig& config) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Surface* surface = FindSurface(id);
+        if (!surface || surface->mesh.vertices_.empty()) {
+            return {};
+        }
+        const double step = std::max(
+                0.002, static_cast<double>(config.voxel_size));
+        geometry::PointCloud out;
+
+        if (surface->adaptive_mesh && !surface->patches.empty()) {
+            for (const auto& leaf : surface->patches) {
+                if (leaf.max_u <= leaf.min_u || leaf.max_v <= leaf.min_v) {
+                    continue;
+                }
+                for (double u = leaf.min_u; u < leaf.max_u + step * 0.5;
+                     u += step) {
+                    for (double v = leaf.min_v; v < leaf.max_v + step * 0.5;
+                         v += step) {
+                        out.points_.push_back(
+                                CornerPosition(*surface, u, v));
+                        out.colors_.push_back(leaf.color);
+                    }
+                }
+            }
+            return out;
+        }
+
+        const int occupy_threshold = surface->occupy_threshold;
+        if (occupy_threshold == std::numeric_limits<int>::max()) {
+            return {};
+        }
+        for (const auto& [cell_ij, cell] : surface->cells) {
+            (void)cell_ij;
+            if (cell.points < occupy_threshold) {
+                continue;
+            }
+            if (cell.max_u <= cell.min_u || cell.max_v <= cell.min_v) {
+                continue;
+            }
+            const Eigen::Vector3d color =
+                    (cell.color_sum / std::max(1, cell.points))
+                            .cwiseMax(Eigen::Vector3d::Zero())
+                            .cwiseMin(Eigen::Vector3d::Ones());
+            for (double u = cell.min_u; u < cell.max_u + step * 0.5;
+                 u += step) {
+                for (double v = cell.min_v; v < cell.max_v + step * 0.5;
+                     v += step) {
+                    out.points_.push_back(CornerPosition(*surface, u, v));
+                    out.colors_.push_back(color);
+                }
+            }
+        }
+        return out;
     }
 
     std::vector<SurfaceInfo> Snapshot() const {
@@ -772,6 +1061,10 @@ private:
         // Lattice corner -> mesh vertex index of the last build; boundary
         // corner flags for snapping.
         std::vector<int> boundary_vertices;
+        geometry::PointCloud source_archive;  // pre-replacement scan points
+        std::vector<planar_polygon::PatchLeaf> patches;
+        bool adaptive_mesh = false;
+        std::string mesh_mode = "legacy_grid";
     };
 
     Surface* FindSurface(int id) {
@@ -798,6 +1091,8 @@ private:
         info.closure = surface.closure;
         info.connected = surface.connected;
         info.block_keys = surface.block_keys;
+        info.patch_count = static_cast<int>(surface.patches.size());
+        info.mesh_mode = surface.mesh_mode;
         return info;
     }
 
@@ -812,9 +1107,22 @@ private:
         return p;
     }
 
-    /// Flat open quad mesh from occupied cells; shared lattice vertices, one
-    /// quad (two triangles) per cell. Also records boundary vertices (corners
-    /// of cell edges not shared by two occupied cells) for corner snapping.
+    /// Pull every mesh vertex back onto the fitted plane.  SnapToNeighbors
+    /// moves corners onto 3-D intersection lines, which lifts them off the
+    /// surface; re-projection keeps the mesh coplanar with source snapshots.
+    static void RepositionVerticesOnPlane(Surface& surface) {
+        const Eigen::Vector3d n = surface.plane.head<3>();
+        const double d0 = surface.plane(3);
+        for (auto& v : surface.mesh.vertices_) {
+            const double d = n.dot(v) + d0;
+            v -= d * n;
+        }
+    }
+
+    /// Flat open quad mesh from occupied cells; one quad (two triangles) per
+    /// cell using each cell's observed (min_u, max_u) x (min_v, max_v) so the
+    /// mesh footprint matches the confirmed points.  Boundary vertices (edges
+    /// without an occupied neighbor) are recorded for corner snapping.
     void BuildSurfaceMesh(Surface& surface,
                           const SegmentationConfig& config) {
         surface.mesh.Clear();
@@ -841,102 +1149,47 @@ private:
         }
         surface.occupied_cells = static_cast<int>(occupied.size());
 
-        std::map<std::pair<int, int>, int> corner_to_vertex;
-        std::map<std::pair<int, int>, Eigen::Vector3d> corner_color_sum;
-        std::map<std::pair<int, int>, int> corner_color_count;
-        // Lattice edge occupancy: key = (i, j, 0 horizontal / 1 vertical).
-        std::map<std::tuple<int, int, int>, int> edge_count;
-
-        // Lattice corner clamped into the observed point extent of its
-        // adjacent occupied cells: interior corners stay on the lattice
-        // (fully covered cells), boundary corners are pulled inward so the
-        // mesh ends where the confirmed cloud points end.
-        auto corner_vertex = [&](int i, int j) -> int {
-            auto it = corner_to_vertex.find({i, j});
-            if (it != corner_to_vertex.end()) {
-                return it->second;
-            }
-            double a = i * surface.cell_size;
-            double b = j * surface.cell_size;
-            double u_lo = std::numeric_limits<double>::max();
-            double u_hi = std::numeric_limits<double>::lowest();
-            double v_lo = u_lo, v_hi = u_hi;
-            for (int di = -1; di <= 0; ++di) {
-                for (int dj = -1; dj <= 0; ++dj) {
-                    auto itc = occupied.find({i + di, j + dj});
-                    if (itc == occupied.end()) {
-                        continue;
-                    }
-                    u_lo = std::min(u_lo, itc->second->min_u);
-                    u_hi = std::max(u_hi, itc->second->max_u);
-                    v_lo = std::min(v_lo, itc->second->min_v);
-                    v_hi = std::max(v_hi, itc->second->max_v);
-                }
-            }
-            if (u_lo <= u_hi) {
-                a = std::min(std::max(a, u_lo), u_hi);
-                b = std::min(std::max(b, v_lo), v_hi);
-            }
-            const int index =
-                    static_cast<int>(surface.mesh.vertices_.size());
-            surface.mesh.vertices_.push_back(CornerPosition(surface, a, b));
-            corner_to_vertex[{i, j}] = index;
-            return index;
-        };
-
+        std::set<int> boundary;
         for (const auto& [cell_ij, cell_ptr] : occupied) {
             const Cell& cell = *cell_ptr;
-            const int i = cell_ij.first;
-            const int j = cell_ij.second;
-            const int v00 = corner_vertex(i, j);
-            const int v10 = corner_vertex(i + 1, j);
-            const int v11 = corner_vertex(i + 1, j + 1);
-            const int v01 = corner_vertex(i, j + 1);
-            surface.mesh.triangles_.push_back({v00, v10, v11});
-            surface.mesh.triangles_.push_back({v00, v11, v01});
-
-            const Eigen::Vector3d color =
-                    cell.color_sum / std::max(1, cell.points);
-            const std::array<std::pair<int, int>, 4> corners = {
-                    std::pair<int, int>{i, j}, {i + 1, j}, {i + 1, j + 1},
-                    {i, j + 1}};
-            for (const auto& corner : corners) {
-                corner_color_sum[corner] += color;
-                ++corner_color_count[corner];
-            }
-            ++edge_count[{i, j, 0}];
-            ++edge_count[{i, j + 1, 0}];
-            ++edge_count[{i, j, 1}];
-            ++edge_count[{i + 1, j, 1}];
-        }
-
-        surface.mesh.vertex_colors_.resize(surface.mesh.vertices_.size(),
-                                           Eigen::Vector3d(0.7, 0.7, 0.7));
-        for (const auto& [corner, index] : corner_to_vertex) {
-            const int count = corner_color_count[corner];
-            if (count > 0) {
-                surface.mesh.vertex_colors_[index] =
-                        (corner_color_sum[corner] / count)
-                                .cwiseMax(Eigen::Vector3d::Zero())
-                                .cwiseMin(Eigen::Vector3d::Ones());
-            }
-        }
-
-        // Boundary corners: endpoints of lattice edges used by one cell only.
-        std::set<int> boundary;
-        for (const auto& [edge, count] : edge_count) {
-            if (count != 1) {
+            if (cell.max_u <= cell.min_u || cell.max_v <= cell.min_v) {
                 continue;
             }
-            const int i = std::get<0>(edge);
-            const int j = std::get<1>(edge);
-            const bool horizontal = std::get<2>(edge) == 0;
-            boundary.insert(corner_to_vertex[{i, j}]);
-            boundary.insert(corner_to_vertex[horizontal
-                                                     ? std::pair<int, int>{
-                                                               i + 1, j}
-                                                     : std::pair<int, int>{
-                                                               i, j + 1}]);
+            const int i = cell_ij.first;
+            const int j = cell_ij.second;
+            const int base =
+                    static_cast<int>(surface.mesh.vertices_.size());
+
+            surface.mesh.vertices_.push_back(
+                    CornerPosition(surface, cell.min_u, cell.min_v));
+            surface.mesh.vertices_.push_back(
+                    CornerPosition(surface, cell.max_u, cell.min_v));
+            surface.mesh.vertices_.push_back(
+                    CornerPosition(surface, cell.max_u, cell.max_v));
+            surface.mesh.vertices_.push_back(
+                    CornerPosition(surface, cell.min_u, cell.max_v));
+
+            const Eigen::Vector3d color =
+                    (cell.color_sum / std::max(1, cell.points))
+                            .cwiseMax(Eigen::Vector3d::Zero())
+                            .cwiseMin(Eigen::Vector3d::Ones());
+            for (int k = 0; k < 4; ++k) {
+                surface.mesh.vertex_colors_.push_back(color);
+            }
+
+            surface.mesh.triangles_.push_back({base, base + 1, base + 2});
+            surface.mesh.triangles_.push_back({base, base + 2, base + 3});
+
+            auto mark_boundary_edge = [&](int ni, int nj, int va, int vb) {
+                if (occupied.find({ni, nj}) == occupied.end()) {
+                    boundary.insert(base + va);
+                    boundary.insert(base + vb);
+                }
+            };
+            mark_boundary_edge(i, j - 1, 0, 1);
+            mark_boundary_edge(i + 1, j, 1, 2);
+            mark_boundary_edge(i, j + 1, 2, 3);
+            mark_boundary_edge(i - 1, j, 3, 0);
         }
         surface.boundary_vertices.assign(boundary.begin(), boundary.end());
 
@@ -949,6 +1202,55 @@ private:
             surface.aabb_min = surface.aabb_min.cwiseMin(p);
             surface.aabb_max = surface.aabb_max.cwiseMax(p);
         }
+        surface.patches.clear();
+        surface.adaptive_mesh = false;
+        surface.mesh_mode = "legacy_grid";
+    }
+
+    /// Adaptive quadtree quads from source_archive on each occupied coarse cell.
+    void BuildAdaptivePatchMesh(Surface& surface,
+                                const SegmentationConfig& config) {
+        surface.mesh.Clear();
+        surface.boundary_vertices.clear();
+        surface.patches.clear();
+        surface.adaptive_mesh = true;
+        surface.mesh_mode = "adaptive_quadtree";
+        surface.occupied_cells = 0;
+
+        std::map<std::pair<int, int>, planar_polygon::OccupiedCellView>
+                cell_views;
+        for (const auto& [cell_ij, cell] : surface.cells) {
+            planar_polygon::OccupiedCellView view;
+            view.points = cell.points;
+            view.color_sum = cell.color_sum;
+            view.min_u = cell.min_u;
+            view.max_u = cell.max_u;
+            view.min_v = cell.min_v;
+            view.max_v = cell.max_v;
+            cell_views.emplace(cell_ij, view);
+        }
+
+        planar_polygon::AdaptiveSurfaceInput input;
+        input.plane = surface.plane;
+        input.u = surface.u;
+        input.v = surface.v;
+        input.cell_size = surface.cell_size;
+        input.cells = &cell_views;
+        input.source_archive = &surface.source_archive;
+
+        const planar_polygon::AdaptiveMeshParams params =
+                MakeAdaptiveMeshParams(config, surface.cell_size);
+        const planar_polygon::AdaptiveMeshResult adaptive_mesh =
+                planar_polygon::BuildAdaptivePatchMesh(input, params);
+
+        surface.mesh = std::move(adaptive_mesh.mesh);
+        surface.patches = std::move(adaptive_mesh.patches);
+        surface.boundary_vertices =
+                std::move(adaptive_mesh.boundary_vertices);
+        surface.occupied_cells = adaptive_mesh.occupied_cells;
+        surface.occupy_threshold = adaptive_mesh.occupy_threshold;
+        surface.aabb_min = adaptive_mesh.aabb_min;
+        surface.aabb_max = adaptive_mesh.aabb_max;
     }
 
     bool ArePotentialNeighbors(const Surface& a,
@@ -1462,19 +1764,19 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
                 config.min_cluster_points) {
         core::Tensor labels = residual.ClusterDBSCAN(
                 config.dbscan_eps, config.min_cluster_points, false);
-        const int64_t num_points = labels.GetLength();
-        int max_label = -1;
-        const int32_t* label_data = labels.GetDataPtr<int32_t>();
-        for (int64_t i = 0; i < num_points; ++i) {
-            max_label = std::max(max_label, label_data[i]);
-        }
-        for (int cluster_id = 0; cluster_id <= max_label; ++cluster_id) {
-            t::geometry::PointCloud cluster =
+    const int64_t num_points = labels.GetLength();
+    int max_label = -1;
+    const int32_t* label_data = labels.GetDataPtr<int32_t>();
+    for (int64_t i = 0; i < num_points; ++i) {
+        max_label = std::max(max_label, label_data[i]);
+    }
+    for (int cluster_id = 0; cluster_id <= max_label; ++cluster_id) {
+        t::geometry::PointCloud cluster =
                     SelectCluster(residual, labels, cluster_id);
-            if (cluster.GetPointPositions().GetLength() <
-                config.min_cluster_points) {
-                continue;
-            }
+        if (cluster.GetPointPositions().GetLength() <
+            config.min_cluster_points) {
+            continue;
+        }
             RegionCandidate candidate;
             candidate.type = ClassifyCluster(cluster);
             if (candidate.type == ObjectType::kWall) {
@@ -1567,18 +1869,20 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
         // Objects keep their real scanned shape: marching-cubes mesh from
         // the frozen TSDF blocks. Primitive box/cylinder shapes are only a
         // fallback (the type label is still reported in GUI/JSON).
-        candidate.mesh = model.ExtractTriangleMeshIncluding(
-                                      config.mesh_weight_threshold, -1,
+                candidate.mesh = model.ExtractTriangleMeshIncluding(
+                        config.mesh_weight_threshold, -1,
                                       candidate.block_keys)
                                  .To(mesh_device);
-        if (!candidate.mesh.HasVertexPositions()) {
-            candidate.mesh = CreatePrimitiveMesh(
+                if (!candidate.mesh.HasVertexPositions()) {
+                    candidate.mesh = CreatePrimitiveMesh(
                     candidate.type == ObjectType::kGeneric
                             ? ObjectType::kBox
                             : candidate.type,
                     candidates[c].points, mesh_device);
         }
         if (candidate.mesh.HasVertexPositions()) {
+            AttachSourceSnapshot(candidate,
+                                 candidates[c].points.ToLegacy(), config);
             frozen_now.push_back(std::move(candidate));
         }
     }
@@ -1605,6 +1909,19 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
         candidate.mesh = t::geometry::TriangleMesh::FromLegacy(
                 mesh_legacy, core::Float32, core::Int64, mesh_device);
         candidate.bounds = mesh_legacy.GetAxisAlignedBoundingBox();
+        const geometry::PointCloud source_raw =
+                atlas.GetMeshAlignedSourcePoints(surface_id, config);
+        AttachSourceSnapshot(candidate, source_raw, config);
+        candidate.patch_count = info.patch_count;
+        candidate.mesh_mode = info.mesh_mode;
+        if (config.save_source_points) {
+            const geometry::PointCloud dense_overlay =
+                    atlas.BuildDenseCellSourceOverlay(surface_id, config);
+            if (!dense_overlay.points_.empty()) {
+                candidate.source_points = std::make_shared<geometry::PointCloud>(
+                        dense_overlay);
+            }
+        }
         frozen_now.push_back(std::move(candidate));
     }
     return frozen_now;

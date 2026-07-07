@@ -33,11 +33,13 @@
 
 #include "open3d/Open3D.h"
 #include "IncrementalMeshFreeze.h"
+#include "SlamTrackingRecovery.h"
 
 namespace {
 
 using namespace open3d;
 namespace tio = open3d::t::io;
+namespace st = examples::slam_tracking;
 
 struct FreezeParams {
     bool auto_freeze = true;
@@ -143,13 +145,6 @@ std::string DefaultConfigPath() {
     return "";
 }
 
-// Tracking tiers: strict pose+integrate vs pose bridge vs reject outlier jumps.
-static constexpr double kPoseFitnessMin = 0.12;
-static constexpr double kPoseTranslationMax = 0.15;
-static constexpr double kWeakFitnessMin = 0.08;
-static constexpr double kWeakTranslationMax = 0.30;
-static constexpr double kOutlierTranslation = 0.50;
-static constexpr float kOdometryHuberDelta = 0.05f;
 static constexpr int kLostTrackingThreshold = 5;
 static constexpr int kStrongStreakAfterLost = 2;
 // Skip integrate/tracking when hash is nearly full (avoids rehash OOM + bad odometry).
@@ -185,59 +180,6 @@ void ClampPointColors(geometry::PointCloud& pcd) {
         c = c.cwiseMax(Eigen::Vector3d::Zero())
                     .cwiseMin(Eigen::Vector3d::Ones());
     }
-}
-
-bool IsOdometrySingularError(const std::exception& e) {
-    const std::string msg = e.what();
-    return msg.find("Singular 6x6") != std::string::npos ||
-           msg.find("singular condition") != std::string::npos;
-}
-
-enum class TrackingTier { kInit, kStrong, kWeak, kOutlier, kFail };
-
-float SafeOdometryDepthDiff(float depth_diff) {
-    return std::max(kOdometryHuberDelta + 0.001f, depth_diff);
-}
-
-double TranslationNorm(const core::Tensor& transformation) {
-    core::Tensor translation =
-            transformation.Slice(0, 0, 3).Slice(1, 3, 4);
-    return std::sqrt(
-            (translation * translation).Sum({0, 1}).Item<double>());
-}
-
-TrackingTier ClassifyTracking(double fitness, double translation) {
-    if (translation >= kOutlierTranslation) {
-        return TrackingTier::kOutlier;
-    }
-    if (fitness >= kPoseFitnessMin && translation < kPoseTranslationMax) {
-        return TrackingTier::kStrong;
-    }
-    if (fitness >= kWeakFitnessMin && translation < kWeakTranslationMax) {
-        return TrackingTier::kWeak;
-    }
-    return TrackingTier::kFail;
-}
-
-bool FrameToFrameBridgeAccepted(double fitness, double translation) {
-    return fitness >= kWeakFitnessMin && translation < kWeakTranslationMax &&
-           translation < kOutlierTranslation;
-}
-
-const char* TrackingTierName(TrackingTier tier) {
-    switch (tier) {
-        case TrackingTier::kInit:
-            return "init";
-        case TrackingTier::kStrong:
-            return "strong";
-        case TrackingTier::kWeak:
-            return "weak";
-        case TrackingTier::kOutlier:
-            return "outlier";
-        case TrackingTier::kFail:
-            return "fail";
-    }
-    return "unknown";
 }
 
 // TSDF voxel weight grows per integration; threshold 3.0 yields zero points on
@@ -449,17 +391,17 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         }
 
         bool integrate = (frame_id == 0) && !hash_near_full;
-        TrackingTier tracking_tier = TrackingTier::kInit;
+        st::TrackingTier tracking_tier = st::TrackingTier::kInit;
 
         if (frame_id > 0 && !hash_near_full) {
-            tracking_tier = TrackingTier::kFail;
+            tracking_tier = st::TrackingTier::kFail;
             try {
                 auto run_model_tracking =
                         [&](float depth_diff) {
                             return model.TrackFrameToModel(
                                     input_frame, raycast_frame,
                                     params.depth_scale, params.depth_max,
-                                    SafeOdometryDepthDiff(depth_diff),
+                                    st::SafeOdometryDepthDiff(depth_diff),
                                     t::pipelines::odometry::Method::PointToPlane,
                                     odom_criteria);
                         };
@@ -467,21 +409,21 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 auto result = run_model_tracking(params.depth_diff);
                 double track_fitness = result.fitness_;
                 double track_translation =
-                        TranslationNorm(result.transformation_);
+                        st::TranslationNorm(result.transformation_);
                 tracking_tier =
-                        ClassifyTracking(track_fitness, track_translation);
+                        st::ClassifyTrackingRealTime(track_fitness, track_translation);
 
-                if (tracking_tier == TrackingTier::kFail &&
-                    track_fitness < kWeakFitnessMin) {
+                if (tracking_tier == st::TrackingTier::kFail &&
+                    track_fitness < st::kWeakFitnessMin) {
                     result = run_model_tracking(params.depth_diff * 2.0f);
                     track_fitness = result.fitness_;
                     track_translation =
-                            TranslationNorm(result.transformation_);
+                            st::TranslationNorm(result.transformation_);
                     tracking_tier =
-                            ClassifyTracking(track_fitness, track_translation);
+                            st::ClassifyTrackingRealTime(track_fitness, track_translation);
                 }
 
-                if (tracking_tier == TrackingTier::kStrong) {
+                if (tracking_tier == st::TrackingTier::kStrong) {
                     T_frame_to_model =
                             T_frame_to_model.Matmul(result.transformation_);
                     ++consecutive_strong;
@@ -500,14 +442,14 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                     consecutive_strong = 0;
                     tracking_was_unstable = true;
                     ++consecutive_tracking_failures;
-                    const char* tier_name = TrackingTierName(tracking_tier);
+                    const char* tier_name = st::TrackingTierName(tracking_tier);
                     utility::LogWarning(
                             "Tracking {} for frame {}, fitness: {:.3f}, "
                             "translation: {:.3f}. Skipping integration.",
                             tier_name, frame_id, track_fitness,
                             track_translation);
 
-                    if (tracking_tier != TrackingTier::kOutlier &&
+                    if (tracking_tier != st::TrackingTier::kOutlier &&
                         !prev_rgbd.IsEmpty()) {
                         try {
                             auto f2f_result =
@@ -519,13 +461,13 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                                                     PointToPlane,
                                             t::pipelines::odometry::
                                                     OdometryLossParams(
-                                                            SafeOdometryDepthDiff(
+                                                            st::SafeOdometryDepthDiff(
                                                                     params
                                                                             .depth_diff)));
                             const double f2f_fitness = f2f_result.fitness_;
                             const double f2f_translation =
-                                    TranslationNorm(f2f_result.transformation_);
-                            if (FrameToFrameBridgeAccepted(f2f_fitness,
+                                    st::TranslationNorm(f2f_result.transformation_);
+                            if (st::FrameToFrameBridgeAccepted(f2f_fitness,
                                                            f2f_translation)) {
                                 T_frame_to_model = T_frame_to_model.Matmul(
                                         f2f_result.transformation_);
@@ -536,7 +478,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                                         frame_id, f2f_fitness, f2f_translation);
                             }
                         } catch (const std::exception& f2f_e) {
-                            if (!IsOdometrySingularError(f2f_e)) {
+                            if (!st::IsOdometrySingularError(f2f_e)) {
                                 utility::LogWarning(
                                         "Frame-to-frame odometry failed at "
                                         "frame {}: {}",
@@ -546,11 +488,11 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                     }
                 }
             } catch (const std::exception& e) {
-                tracking_tier = TrackingTier::kFail;
+                tracking_tier = st::TrackingTier::kFail;
                 consecutive_strong = 0;
                 tracking_was_unstable = true;
                 ++consecutive_tracking_failures;
-                if (IsOdometrySingularError(e)) {
+                if (st::IsOdometrySingularError(e)) {
                     utility::LogWarning(
                             "Odometry singular at frame {} (low overlap or "
                             "featureless view).",
@@ -561,7 +503,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 }
             }
         } else if (frame_id > 0 && hash_near_full) {
-            tracking_tier = TrackingTier::kFail;
+            tracking_tier = st::TrackingTier::kFail;
             integrate = false;
             ++consecutive_tracking_failures;
         } else {
@@ -657,14 +599,14 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         } else if (consecutive_tracking_failures > kLostTrackingThreshold) {
             status += " | LOST " + std::to_string(consecutive_tracking_failures) +
                       " — move slowly back";
-        } else if (frame_id > 0 && tracking_tier != TrackingTier::kStrong) {
-            status += " | tracking " + std::string(TrackingTierName(tracking_tier));
+        } else if (frame_id > 0 && tracking_tier != st::TrackingTier::kStrong) {
+            status += " | tracking " + std::string(st::TrackingTierName(tracking_tier));
         }
         state.SetStatus(status);
 
         utility::LogInfo("SLAM frame {} | hash blocks {}/{} | tier {}", frame_id,
                          hash_size_before, hash_capacity,
-                         TrackingTierName(tracking_tier));
+                         st::TrackingTierName(tracking_tier));
         prev_rgbd = rgbd;
         ++frame_id;
     }

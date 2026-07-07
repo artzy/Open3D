@@ -112,10 +112,15 @@ box/cylinder로 분류된 클러스터도 primitive 대신 **TSDF marching cubes
 
 ## GUI / 저장
 
-- Info 탭: `Surfaces (N): #id type area closure%` 목록 + frozen region 수
-- JSON `objects/frozen_blocks.json`: 기존 `objects` 배열 유지 + `surfaces`
-  배열 추가 `{id, type, plane, cell_size, cell_count, closure, connected}`
-- 평면 메시 파일명 `surface_{id}.ply` (성장 시 갱신), 객체는 `object_{id}.ply`
+- Info 탭: `Surfaces (N): #id type area closure%` 목록 + frozen region 수 +
+  per-region `rmse mm (pts)` (소스 snapshot 있을 때)
+- Settings: **Show source cloud** / **Show plane mesh** 독립 토글
+- JSON `objects/frozen_blocks.json`: `objects` + `surfaces` 배열;
+  `source_point_cloud`, `source_point_count`, `compare_rmse` 필드
+- 평면 메시 `surface_{id}.ply`, 객체 `object_{id}.ply`,
+  대체 전 포인트 `source_{id}.ply`
+
+상세: [`OnlineSLAM-source-point-snapshot.md`](OnlineSLAM-source-point-snapshot.md)
 
 ## 테스트 (Lounge 150초, CUDA)
 
