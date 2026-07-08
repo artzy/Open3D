@@ -10,4 +10,12 @@
       <Filter>cpp</Filter>
     </ClCompile>
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="cpp\RealTimeSLAMUtil.h">
+      <Filter>cpp</Filter>
+    </ClInclude>
+    <ClInclude Include="cpp\ObjectMeshPipeline.h">
+      <Filter>cpp</Filter>
+    </ClInclude>
+  </ItemGroup>
 </Project>

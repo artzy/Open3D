@@ -69,6 +69,12 @@ struct SegmentationConfig {
     int min_cluster_points = 5000;
     int stability_frames = 5;
     bool auto_freeze = true;
+    /// When true, always extract TSDF triangle mesh via ExtractTriangleMeshIncluding
+    /// instead of analytic primitive meshes (wall/box/cylinder).
+    bool tsdf_mesh_only = false;
+    /// When true, ProcessExtractedSurface only clusters/tracks; call
+    /// ApplyFreezeAndExtractMesh under model_mutex afterward.
+    bool defer_model_ops = false;
     float voxel_size = 3.0f / 512.0f;
     float trunc_multiplier = 8.0f;
     float mesh_weight_threshold = 3.0f;
@@ -83,6 +89,8 @@ struct FrozenObjectCandidate {
     core::Tensor block_keys;
     geometry::AxisAlignedBoundingBox bounds;
     ClusterSignature signature;
+    /// Populated when defer_model_ops is true; consumed by ApplyFreezeAndExtractMesh.
+    t::geometry::PointCloud source_cluster;
 };
 
 struct TrackedCluster {
@@ -348,6 +356,39 @@ inline t::geometry::PointCloud SelectCluster(
     return pcd.SelectByMask(mask);
 }
 
+inline void ApplyFreezeAndExtractMesh(
+        FrozenObjectCandidate& candidate,
+        t::pipelines::slam::Model& model,
+        const SegmentationConfig& config) {
+    t::geometry::PointCloud cluster = candidate.source_cluster;
+    if (!cluster.HasPointPositions()) {
+        return;
+    }
+
+    const core::Device mesh_device =
+            model.voxel_grid_.GetHashMap().GetDevice();
+    candidate.block_keys = CollectBlockKeys(model.voxel_grid_, cluster,
+                                            config.trunc_multiplier);
+    if (candidate.block_keys.NumElements() == 0) {
+        return;
+    }
+
+    model.FreezeBlocks(candidate.block_keys);
+    if (config.tsdf_mesh_only || candidate.type == ObjectType::kGeneric) {
+        candidate.mesh = model.ExtractTriangleMeshIncluding(
+                config.mesh_weight_threshold, -1, candidate.block_keys);
+        if (!candidate.mesh.HasVertexPositions()) {
+            candidate.mesh = CreatePrimitiveMesh(
+                    ObjectType::kBox, cluster, mesh_device);
+        }
+    } else {
+        candidate.mesh =
+                CreatePrimitiveMesh(candidate.type, cluster, mesh_device);
+    }
+    candidate.bounds = cluster.GetAxisAlignedBoundingBox().ToLegacy();
+    candidate.source_cluster = t::geometry::PointCloud();
+}
+
 inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
         const t::geometry::PointCloud& surface_pcd,
         t::pipelines::slam::Model& model,
@@ -360,9 +401,6 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
                 config.min_cluster_points) {
         return frozen_now;
     }
-
-    const core::Device mesh_device =
-            model.voxel_grid_.GetHashMap().GetDevice();
 
     t::geometry::PointCloud pcd_cpu = surface_pcd.To(core::Device("CPU:0"));
     core::Tensor labels =
@@ -416,25 +454,16 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
             return candidate;
         }
 
-        candidate.block_keys = CollectBlockKeys(model.voxel_grid_,
-                                                matched_cluster,
-                                                config.trunc_multiplier);
-        if (candidate.block_keys.NumElements() > 0) {
-            model.FreezeBlocks(candidate.block_keys);
-            if (type == ObjectType::kGeneric) {
-                candidate.mesh = model.ExtractTriangleMeshIncluding(
-                        config.mesh_weight_threshold, -1,
-                        candidate.block_keys);
-                if (!candidate.mesh.HasVertexPositions()) {
-                    candidate.mesh = CreatePrimitiveMesh(
-                            ObjectType::kBox, matched_cluster, mesh_device);
-                }
-            } else {
-                candidate.mesh = CreatePrimitiveMesh(
-                        type, matched_cluster, mesh_device);
-            }
+        if (config.defer_model_ops) {
+            candidate.source_cluster = std::move(matched_cluster);
+            candidate.bounds =
+                    candidate.source_cluster.GetAxisAlignedBoundingBox()
+                            .ToLegacy();
+            return candidate;
         }
-        candidate.bounds = matched_cluster.GetAxisAlignedBoundingBox().ToLegacy();
+
+        candidate.source_cluster = matched_cluster;
+        ApplyFreezeAndExtractMesh(candidate, model, config);
         return candidate;
     };
 
