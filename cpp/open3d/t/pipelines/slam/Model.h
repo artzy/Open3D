@@ -35,11 +35,17 @@ public:
 
     core::Tensor GetCurrentFramePose() const { return T_frame_to_world_; }
     void UpdateFramePose(int frame_id, const core::Tensor& T_frame_to_world) {
-        if (frame_id != frame_id_ + 1) {
+        if (frame_id > frame_id_ + 1) {
             utility::LogWarning("Skipped {} frames in update T!",
                                 frame_id - (frame_id_ + 1));
+        } else if (frame_id < frame_id_) {
+            utility::LogWarning(
+                    "Frame id moved backwards in update T! ({} -> {})",
+                    frame_id_, frame_id);
         }
-        frame_id_ = frame_id;
+        if (frame_id >= frame_id_) {
+            frame_id_ = frame_id;
+        }
         T_frame_to_world_ = T_frame_to_world.Contiguous();
     }
 

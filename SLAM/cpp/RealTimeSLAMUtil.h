@@ -118,11 +118,52 @@ public:
             return status_;
         }
 
+        void SetRelocDetail(const std::string& detail) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            reloc_detail_ = detail;
+            has_reloc_detail_update_ = true;
+        }
+
+        bool TakeRelocDetail(std::string& detail) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!has_reloc_detail_update_) {
+                return false;
+            }
+            detail = reloc_detail_;
+            has_reloc_detail_update_ = false;
+            return true;
+        }
+
+        void SetKeyframeMarkers(std::vector<Eigen::Vector3d> markers) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            keyframe_markers_ = std::move(markers);
+            has_keyframe_marker_update_ = true;
+        }
+
+        bool TakeKeyframeMarkers(std::vector<Eigen::Vector3d>& markers) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!has_keyframe_marker_update_) {
+                return false;
+            }
+            markers = std::move(keyframe_markers_);
+            has_keyframe_marker_update_ = false;
+            return true;
+        }
+
+        void SetShowKeyframeMarkers(bool show) {
+            show_keyframe_markers_.store(show);
+        }
+
+        bool ShowKeyframeMarkers() const {
+            return show_keyframe_markers_.load();
+        }
+
         void SetRegionCount(int count) { region_count_.store(count); }
         int RegionCount() const { return region_count_.load(); }
 
         std::atomic<bool> request_stop{false};
         std::atomic<bool> slam_finished{false};
+        std::atomic<bool> reloc_self_test_finished{false};
 
     private:
         mutable std::mutex mutex_;
@@ -136,6 +177,11 @@ public:
         bool pose_diff_visible_ = false;
         bool has_pose_diff_update_ = false;
         std::string status_;
+        std::string reloc_detail_;
+        bool has_reloc_detail_update_ = false;
+        std::vector<Eigen::Vector3d> keyframe_markers_;
+        bool has_keyframe_marker_update_ = false;
+        std::atomic<bool> show_keyframe_markers_{false};
         std::atomic<int> region_count_{0};
     };
 
@@ -198,6 +244,22 @@ public:
         panel_->AddChild(pose_diff_label_);
         pose_diff_title_->SetVisible(false);
         pose_diff_label_->SetVisible(false);
+        panel_->AddFixed(vspacing);
+
+        reloc_detail_label_ = std::make_shared<gui::Label>("");
+        reloc_detail_label_->SetFontId(monospace);
+        panel_->AddChild(reloc_detail_label_);
+        panel_->AddFixed(vspacing);
+
+        keyframe_marker_toggle_ = std::make_shared<gui::ToggleSwitch>(
+                "Keyframe markers");
+        keyframe_marker_toggle_->SetOn(false);
+        keyframe_marker_toggle_->SetOnClicked([this](bool is_on) {
+            state_.SetShowKeyframeMarkers(is_on);
+            gui::Application::GetInstance().PostToMainThread(
+                    this, [this]() { ApplyKeyframeMarkerVisibility(); });
+        });
+        panel_->AddChild(keyframe_marker_toggle_);
         panel_->AddStretch();
 
         widget3d_->SetScene(
@@ -240,6 +302,8 @@ private:
     std::shared_ptr<gui::Label> status_label_;
     std::shared_ptr<gui::Label> pose_diff_title_;
     std::shared_ptr<gui::Label> pose_diff_label_;
+    std::shared_ptr<gui::Label> reloc_detail_label_;
+    std::shared_ptr<gui::ToggleSwitch> keyframe_marker_toggle_;
 
     bool live_pcd_added_ = false;
     bool live_pcd_visible_ = true;
@@ -256,6 +320,11 @@ private:
         bool has_pcd = false;
     };
     std::vector<StoredRegionGeometry> region_geometry_;
+    struct StoredKeyframeMarker {
+        t::geometry::TriangleMesh mesh;
+    };
+    std::vector<StoredKeyframeMarker> keyframe_marker_geometry_;
+    std::vector<std::string> keyframe_marker_names_;
 
     rendering::Open3DScene* GetOpen3DScene() {
         return widget3d_->GetScene().get();
@@ -427,7 +496,50 @@ private:
         lost_camera_marker_added_ = true;
     }
 
+    void ApplyKeyframeMarkerVisibility() {
+        auto* scene = GetOpen3DScene();
+        const bool show = state_.ShowKeyframeMarkers();
+        for (const auto& name : keyframe_marker_names_) {
+            if (scene->HasGeometry(name)) {
+                scene->ShowGeometry(name, show);
+            }
+        }
+    }
+
+    void UpdateKeyframeMarkers(const std::vector<Eigen::Vector3d>& markers) {
+        using namespace rendering;
+        auto* scene = GetOpen3DScene();
+        for (const auto& name : keyframe_marker_names_) {
+            if (scene->HasGeometry(name)) {
+                scene->RemoveGeometry(name);
+            }
+        }
+        keyframe_marker_names_.clear();
+        keyframe_marker_geometry_.clear();
+
+        MaterialRecord mat;
+        mat.shader = "defaultLit";
+        mat.base_color = Eigen::Vector4f(0.2f, 0.7f, 1.0f, 1.0f);
+
+        for (size_t i = 0; i < markers.size(); ++i) {
+            auto sphere = geometry::TriangleMesh::CreateSphere(0.03);
+            sphere->Translate(markers[i]);
+            sphere->PaintUniformColor(Eigen::Vector3d(0.2, 0.7, 1.0));
+            StoredKeyframeMarker stored;
+            stored.mesh = t::geometry::TriangleMesh::FromLegacy(*sphere);
+            keyframe_marker_geometry_.push_back(std::move(stored));
+            const std::string name = "keyframe_" + std::to_string(i);
+            keyframe_marker_names_.push_back(name);
+            scene->AddGeometry(name, &keyframe_marker_geometry_.back().mesh,
+                               mat);
+        }
+        ApplyKeyframeMarkerVisibility();
+    }
+
     bool OnTick() {
+        if (state_.reloc_self_test_finished.load()) {
+            return false;
+        }
         if (state_.request_stop.load() && state_.slam_finished.load()) {
             return false;
         }
@@ -456,6 +568,16 @@ private:
             pose_diff_label_->SetVisible(pose_diff_visible);
             pose_diff_label_->SetText(pose_diff_text.c_str());
             SetNeedsLayout();
+        }
+
+        std::string reloc_detail;
+        if (state_.TakeRelocDetail(reloc_detail)) {
+            reloc_detail_label_->SetText(reloc_detail.c_str());
+        }
+
+        std::vector<Eigen::Vector3d> keyframe_markers;
+        if (state_.TakeKeyframeMarkers(keyframe_markers)) {
+            UpdateKeyframeMarkers(keyframe_markers);
         }
 
         const std::string status = state_.Status();

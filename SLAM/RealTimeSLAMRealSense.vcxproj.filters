@@ -17,5 +17,8 @@
     <ClInclude Include="cpp\ObjectMeshPipeline.h">
       <Filter>cpp</Filter>
     </ClInclude>
+    <ClInclude Include="cpp\Relocalization.h">
+      <Filter>cpp</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
