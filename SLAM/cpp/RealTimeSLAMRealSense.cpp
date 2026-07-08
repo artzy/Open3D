@@ -275,6 +275,24 @@ public:
     }
 };
 
+// SLAM/RGB-D world uses +Y down; legacy ViewControl::Reset() uses +Y up.
+void ApplySlamViewOrientation(visualization::Visualizer& vis) {
+    auto& vc = vis.GetViewControl();
+    vc.SetUp(Eigen::Vector3d(0.0, -1.0, 0.0));
+    vc.SetFront(Eigen::Vector3d(0.0, 0.0, -1.0));
+}
+
+// Fit the scene once; never call ResetViewPoint again on live updates.
+void ConfigureSlamViewOnce(visualization::Visualizer& vis,
+                           bool& camera_view_initialized) {
+    if (camera_view_initialized) {
+        return;
+    }
+    vis.ResetViewPoint(true);
+    ApplySlamViewOrientation(vis);
+    camera_view_initialized = true;
+}
+
 void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 const core::Tensor& intrinsic,
                 const camera::PinholeCameraIntrinsic& cam_intrinsic,
@@ -284,9 +302,26 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
     using t::pipelines::slam::Frame;
     using t::pipelines::slam::Model;
 
-    t::geometry::RGBDImage first = capture_frame();
+    t::geometry::RGBDImage first;
+    for (int attempt = 0; attempt < kMaxEmptyCaptureRetries; ++attempt) {
+        first = capture_frame();
+        if (!first.IsEmpty()) {
+            if (attempt > 0) {
+                utility::LogInfo(
+                        "First RGB-D frame captured after {} warmup attempt(s).",
+                        attempt);
+            }
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (first.IsEmpty()) {
-        utility::LogError("Failed to capture the first RGB-D frame.");
+        utility::LogWarning(
+                "Failed to capture the first RGB-D frame after {} attempts. "
+                "Check that the camera is connected and not in use by another "
+                "application.",
+                kMaxEmptyCaptureRetries);
+        state.slam_finished.store(true);
         return;
     }
 
@@ -360,9 +395,9 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 IsHashNearFull(hash_size_before, hash_capacity);
         if (hash_near_full && !hash_full_warned) {
             utility::LogWarning(
-                    "Voxel hash nearly full ({}/{}). Pausing integration and "
-                    "tracking. Finish the scan or use --profile high / "
-                    "--block_count.",
+                    "Voxel hash nearly full ({}/{}). Stopping map growth but "
+                    "continuing pose tracking. Press ESC to finish and save, "
+                    "or restart with --profile high / --block_count.",
                     hash_size_before, hash_capacity);
             hash_full_warned = true;
         }
@@ -370,7 +405,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         bool integrate = (frame_id == 0) && !hash_near_full;
         TrackingTier tracking_tier = TrackingTier::kInit;
 
-        if (frame_id > 0 && !hash_near_full) {
+        if (frame_id > 0) {
             tracking_tier = TrackingTier::kFail;
             try {
                 auto run_model_tracking =
@@ -405,9 +440,10 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                             T_frame_to_model.Matmul(result.transformation_);
                     ++consecutive_strong;
                     consecutive_tracking_failures = 0;
-                    if (!tracking_was_unstable) {
+                    if (!hash_near_full && !tracking_was_unstable) {
                         integrate = true;
-                    } else if (consecutive_strong >= kStrongStreakAfterLost) {
+                    } else if (!hash_near_full && tracking_was_unstable &&
+                               consecutive_strong >= kStrongStreakAfterLost) {
                         integrate = true;
                         tracking_was_unstable = false;
                         utility::LogInfo(
@@ -479,11 +515,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                                         frame_id, e.what());
                 }
             }
-        } else if (frame_id > 0 && hash_near_full) {
-            tracking_tier = TrackingTier::kFail;
-            integrate = false;
-            ++consecutive_tracking_failures;
-        } else {
+        } else if (frame_id == 0) {
             consecutive_strong = 1;
         }
 
@@ -527,7 +559,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                              std::to_string(hash_size_before) + "/" +
                              std::to_string(hash_capacity);
         if (hash_near_full) {
-            status += " | HASH FULL";
+            status += " | HASH FULL (tracking only)";
         } else if (consecutive_tracking_failures > kLostTrackingThreshold) {
             status += " | LOST " + std::to_string(consecutive_tracking_failures) +
                       " — move slowly back";
@@ -539,6 +571,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         utility::LogInfo("SLAM frame {} | hash blocks {}/{} | tier {}", frame_id,
                          hash_size_before, hash_capacity,
                          TrackingTierName(tracking_tier));
+
         prev_rgbd = rgbd;
         ++frame_id;
     }
@@ -726,6 +759,8 @@ int main(int argc, char* argv[]) {
         intrinsic = core::eigen_converter::EigenMatrixToTensor(
                 rs.GetMetadata().intrinsics_.intrinsic_matrix_);
         rs.StartCapture(!record_bag.empty());
+        // RealSense pipelines need a short warmup before the first frame.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
         capture_frame = [&rs, align_streams]() -> t::geometry::RGBDImage {
             return rs.CaptureFrame(true, align_streams);
@@ -751,8 +786,10 @@ int main(int argc, char* argv[]) {
 
     vis.GetRenderOption().background_color_ = Eigen::Vector3d(0.1, 0.1, 0.1);
     vis.GetRenderOption().point_size_ = 2.0;
+    ApplySlamViewOrientation(vis);
 
     bool geometry_added = false;
+    bool camera_view_initialized = false;
     std::shared_ptr<geometry::PointCloud> render_pcd;
     std::string last_window_status;
 
@@ -767,8 +804,9 @@ int main(int argc, char* argv[]) {
         if (shared.TakeUpdate(updated) && updated && !updated->IsEmpty()) {
             if (!geometry_added) {
                 render_pcd = updated;
-                vis.AddGeometry(render_pcd);
-                vis.ResetViewPoint(true);
+                // Do not reset the view here; AddGeometry(..., true) forces +Y up.
+                vis.AddGeometry(render_pcd, /*reset_bounding_box=*/false);
+                ConfigureSlamViewOnce(vis, camera_view_initialized);
                 geometry_added = true;
             } else {
                 // Visualizer matches geometry by pointer; reuse render_pcd and
