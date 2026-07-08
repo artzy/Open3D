@@ -13,6 +13,7 @@
 #include <numeric>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "open3d/Open3D.h"
@@ -305,6 +306,59 @@ private:
     std::vector<TrackedCluster> tracked_clusters_;
 };
 
+struct BlockKey3 {
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t z = 0;
+    bool operator==(const BlockKey3& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct BlockKey3Hash {
+    size_t operator()(const BlockKey3& key) const {
+        return (static_cast<size_t>(key.x) * 73856093u) ^
+               (static_cast<size_t>(key.y) * 19349663u) ^
+               (static_cast<size_t>(key.z) * 83492791u);
+    }
+};
+
+/// Marching-cubes mesh extract needs a 1-block halo; partial block sets crash
+/// CUDA when neighbor indices are missing from inverse_index_map.
+inline core::Tensor ExpandBlockKeysForMeshExtract(
+        const core::Tensor& block_keys) {
+    if (block_keys.NumElements() == 0) {
+        return block_keys;
+    }
+    core::Tensor keys_cpu =
+            block_keys.To(core::Device("CPU:0")).Contiguous();
+    const int32_t* data = keys_cpu.GetDataPtr<int32_t>();
+    const int64_t n = keys_cpu.GetLength();
+    std::unordered_set<BlockKey3, BlockKey3Hash> expanded;
+    expanded.reserve(static_cast<size_t>(n) * 27);
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t x = data[i * 3 + 0];
+        const int32_t y = data[i * 3 + 1];
+        const int32_t z = data[i * 3 + 2];
+        for (int32_t dx = -1; dx <= 1; ++dx) {
+            for (int32_t dy = -1; dy <= 1; ++dy) {
+                for (int32_t dz = -1; dz <= 1; ++dz) {
+                    expanded.insert({x + dx, y + dy, z + dz});
+                }
+            }
+        }
+    }
+    std::vector<int32_t> flat;
+    flat.reserve(expanded.size() * 3);
+    for (const auto& key : expanded) {
+        flat.push_back(key.x);
+        flat.push_back(key.y);
+        flat.push_back(key.z);
+    }
+    return core::Tensor(flat, {static_cast<int64_t>(expanded.size()), 3},
+                        core::Int32, core::Device("CPU:0"));
+}
+
 inline core::Tensor CollectBlockKeys(
         t::geometry::VoxelBlockGrid& vbg,
         const t::geometry::PointCloud& cluster,
@@ -496,8 +550,8 @@ inline void ApplyFreezeAndExtractMesh(
     const double bounds_margin =
             static_cast<double>(config.voxel_size) * config.trunc_multiplier;
 
-    candidate.block_keys = CollectBlockKeys(model.voxel_grid_, cluster,
-                                            config.trunc_multiplier);
+    candidate.block_keys = ExpandBlockKeysForMeshExtract(
+            CollectBlockKeys(model.voxel_grid_, cluster, config.trunc_multiplier));
     const core::Device mesh_device =
             model.voxel_grid_.GetHashMap().GetDevice();
     if (candidate.block_keys.NumElements() == 0) {

@@ -1171,9 +1171,9 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             }
         }
 
-        model.UpdateFramePose(frame_id, T_frame_to_model);
         {
             std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
+            model.UpdateFramePose(frame_id, T_frame_to_model);
             if (integrate && !hash_near_full) {
                 model.Integrate(input_frame, params.depth_scale, params.depth_max,
                                 params.trunc_multiplier);
@@ -1228,8 +1228,10 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 t::geometry::PointCloud region_pcd;
                 {
                     std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
+                    // 2-pass extract (-1) avoids CUDA buffer overrun when the map
+                    // exceeds kMaxRegionSegmentationPoints; downsample in worker.
                     region_pcd = model.ExtractPointCloudExcludingFrozen(
-                            region_weight, kMaxRegionSegmentationPoints);
+                            region_weight, -1);
                     region_pcd = region_pcd.To(core::Device("CPU:0"));
                 }
                 if (region_pcd.HasPointPositions()) {
