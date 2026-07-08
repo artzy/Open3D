@@ -41,6 +41,21 @@
 namespace {
 
 using namespace open3d;
+
+int64_t MeshVertexCount(const t::geometry::TriangleMesh& mesh) {
+    if (!mesh.HasVertexPositions()) {
+        return 0;
+    }
+    return mesh.GetVertexPositions().GetLength();
+}
+
+int64_t MeshTriangleCount(const t::geometry::TriangleMesh& mesh) {
+    if (!mesh.HasTriangleIndices()) {
+        return 0;
+    }
+    return mesh.GetTriangleIndices().GetLength();
+}
+
 namespace tio = open3d::t::io;
 namespace object_mesh = open3d::examples::object_mesh;
 namespace realtime_slam = open3d::examples::realtime_slam;
@@ -609,24 +624,26 @@ void RegionWorker(SlamRuntime& runtime,
             }
 
             std::vector<object_mesh::FrozenObjectCandidate> frozen_now;
-            {
-                std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
-                for (auto& candidate : pending) {
-                    try {
-                        const t::geometry::PointCloud region_cluster =
-                                candidate.source_cluster;
+            for (auto& candidate : pending) {
+                const t::geometry::PointCloud region_cluster =
+                        candidate.source_cluster;
+                try {
+                    {
+                        std::lock_guard<std::mutex> model_lock(
+                                runtime.model_mutex);
                         object_mesh::ApplyFreezeAndExtractMesh(
                                 candidate, *runtime.model, config);
-                        if (candidate.mesh.HasVertexPositions()) {
-                            candidate.source_cluster = region_cluster;
-                            frozen_now.push_back(std::move(candidate));
-                        }
-                    } catch (const std::exception& e) {
-                        utility::LogWarning(
-                                "Region freeze skipped for candidate {} at "
-                                "frame {}: {}",
-                                candidate.id, frame_id, e.what());
                     }
+                    if (candidate.mesh.HasVertexPositions() ||
+                        region_cluster.HasPointPositions()) {
+                        candidate.source_cluster = region_cluster;
+                        frozen_now.push_back(std::move(candidate));
+                    }
+                } catch (const std::exception& e) {
+                    utility::LogWarning(
+                            "Region freeze skipped for candidate {} at "
+                            "frame {}: {}",
+                            candidate.id, frame_id, e.what());
                 }
             }
 
@@ -651,9 +668,12 @@ void RegionWorker(SlamRuntime& runtime,
 
                     DisplayState::RegionPair pair;
                     pair.id = record.id;
-                    pair.mesh = std::make_shared<geometry::TriangleMesh>(
-                            candidate.mesh.ToLegacy());
-                    ClampVertexColors(*pair.mesh);
+                    if (candidate.mesh.HasTriangleIndices() &&
+                        MeshTriangleCount(candidate.mesh) > 0) {
+                        pair.mesh = std::make_shared<geometry::TriangleMesh>(
+                                candidate.mesh.ToLegacy());
+                        ClampVertexColors(*pair.mesh);
+                    }
                     if (candidate.source_cluster.HasPointPositions()) {
                         pair.pcd = std::make_shared<geometry::PointCloud>(
                                 candidate.source_cluster.ToLegacy());

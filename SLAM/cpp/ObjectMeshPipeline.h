@@ -81,7 +81,111 @@ struct SegmentationConfig {
     float mesh_weight_threshold = 3.0f;
     double centroid_match_eps = 0.15;
     double extent_iou_min = 0.7;
+    int block_resolution = 16;
+    double max_triangle_edge_multiplier = 2.0;
+    double cluster_outlier_std_ratio = 2.0;
+    double max_cluster_extent_m = 1.2;
+    double max_triangle_aspect_ratio = 20.0;
 };
+
+struct RegionMeshSanitizeStats {
+    int tris_before = 0;
+    int tris_after = 0;
+    int removed_invalid = 0;
+    int removed_long_edge = 0;
+    int removed_out_of_bounds = 0;
+    int removed_needle = 0;
+    double max_edge_seen = 0.0;
+};
+
+inline t::geometry::PointCloud TightenClusterForFreeze(
+        const t::geometry::PointCloud& cluster,
+        double std_ratio) {
+    geometry::PointCloud legacy = cluster.ToLegacy();
+    if (legacy.points_.size() < 50) {
+        return cluster;
+    }
+    auto [filtered, _] =
+            legacy.RemoveStatisticalOutliers(20, std_ratio, false);
+    if (!filtered || filtered->points_.empty()) {
+        return cluster;
+    }
+    return t::geometry::PointCloud::FromLegacy(*filtered, core::Float32,
+                                               core::Device("CPU:0"));
+}
+
+inline RegionMeshSanitizeStats SanitizeRegionTriangleMesh(
+        geometry::TriangleMesh& mesh,
+        const geometry::AxisAlignedBoundingBox& cluster_bounds,
+        double max_edge_length,
+        double bounds_margin,
+        double max_aspect_ratio) {
+    RegionMeshSanitizeStats stats;
+    if (mesh.vertices_.empty() || mesh.triangles_.empty()) {
+        return stats;
+    }
+    stats.tris_before = static_cast<int>(mesh.triangles_.size());
+
+    geometry::AxisAlignedBoundingBox expanded = cluster_bounds;
+    expanded.min_bound_ -= Eigen::Vector3d::Constant(bounds_margin);
+    expanded.max_bound_ += Eigen::Vector3d::Constant(bounds_margin);
+
+    const int n_verts = static_cast<int>(mesh.vertices_.size());
+    std::vector<bool> remove_mask(static_cast<size_t>(stats.tris_before), false);
+    auto inside_bounds = [&](const Eigen::Vector3d& p) {
+        return (p.array() >= expanded.min_bound_.array()).all() &&
+               (p.array() <= expanded.max_bound_.array()).all();
+    };
+
+    for (int i = 0; i < stats.tris_before; ++i) {
+        const Eigen::Vector3i& tri = mesh.triangles_[static_cast<size_t>(i)];
+        if (tri(0) < 0 || tri(1) < 0 || tri(2) < 0 || tri(0) >= n_verts ||
+            tri(1) >= n_verts || tri(2) >= n_verts) {
+            remove_mask[static_cast<size_t>(i)] = true;
+            ++stats.removed_invalid;
+            continue;
+        }
+        const Eigen::Vector3d& v0 = mesh.vertices_[static_cast<size_t>(tri(0))];
+        const Eigen::Vector3d& v1 = mesh.vertices_[static_cast<size_t>(tri(1))];
+        const Eigen::Vector3d& v2 = mesh.vertices_[static_cast<size_t>(tri(2))];
+        if (!v0.allFinite() || !v1.allFinite() || !v2.allFinite()) {
+            remove_mask[static_cast<size_t>(i)] = true;
+            ++stats.removed_invalid;
+            continue;
+        }
+        const double e01 = (v0 - v1).norm();
+        const double e12 = (v1 - v2).norm();
+        const double e20 = (v2 - v0).norm();
+        stats.max_edge_seen =
+                std::max({stats.max_edge_seen, e01, e12, e20});
+        const double min_edge =
+                std::min({e01, e12, e20, std::numeric_limits<double>::max()});
+        const double max_edge = std::max({e01, e12, e20});
+        if (min_edge > 1e-9 && max_edge / min_edge > max_aspect_ratio &&
+            max_edge > max_edge_length * 0.25) {
+            remove_mask[static_cast<size_t>(i)] = true;
+            ++stats.removed_needle;
+            continue;
+        }
+        if (e01 > max_edge_length || e12 > max_edge_length ||
+            e20 > max_edge_length) {
+            remove_mask[static_cast<size_t>(i)] = true;
+            ++stats.removed_long_edge;
+            continue;
+        }
+        if (!inside_bounds(v0) || !inside_bounds(v1) || !inside_bounds(v2)) {
+            remove_mask[static_cast<size_t>(i)] = true;
+            ++stats.removed_out_of_bounds;
+            continue;
+        }
+    }
+
+    mesh.RemoveTrianglesByMask(remove_mask);
+    mesh.RemoveUnreferencedVertices();
+    mesh.RemoveDegenerateTriangles();
+    stats.tris_after = static_cast<int>(mesh.triangles_.size());
+    return stats;
+}
 
 struct FrozenObjectCandidate {
     int id = -1;
@@ -376,37 +480,72 @@ inline void ApplyFreezeAndExtractMesh(
         FrozenObjectCandidate& candidate,
         t::pipelines::slam::Model& model,
         const SegmentationConfig& config) {
-    t::geometry::PointCloud cluster = candidate.source_cluster;
+    t::geometry::PointCloud cluster =
+            TightenClusterForFreeze(candidate.source_cluster,
+                                    config.cluster_outlier_std_ratio);
     if (!cluster.HasPointPositions()) {
         return;
     }
+
+    const geometry::AxisAlignedBoundingBox cluster_bounds =
+            cluster.GetAxisAlignedBoundingBox().ToLegacy();
+    const double max_edge_length = std::min(
+            static_cast<double>(config.voxel_size) * config.block_resolution *
+                    config.max_triangle_edge_multiplier,
+            std::max(0.05, cluster_bounds.GetMaxExtent() * 0.35));
+    const double bounds_margin =
+            static_cast<double>(config.voxel_size) * config.trunc_multiplier;
 
     candidate.block_keys = CollectBlockKeys(model.voxel_grid_, cluster,
                                             config.trunc_multiplier);
     const core::Device mesh_device =
             model.voxel_grid_.GetHashMap().GetDevice();
     if (candidate.block_keys.NumElements() == 0) {
-        candidate.mesh = CreatePrimitiveMesh(
-                candidate.type == ObjectType::kGeneric ? ObjectType::kBox
-                                                       : candidate.type,
-                cluster, mesh_device);
-        candidate.bounds = cluster.GetAxisAlignedBoundingBox().ToLegacy();
+        candidate.bounds = cluster_bounds;
         return;
     }
 
     model.FreezeBlocks(candidate.block_keys);
     if (config.tsdf_mesh_only || candidate.type == ObjectType::kGeneric) {
-        candidate.mesh = model.ExtractTriangleMeshIncluding(
-                config.mesh_weight_threshold, -1, candidate.block_keys);
-        if (!candidate.mesh.HasVertexPositions()) {
-            candidate.mesh = CreatePrimitiveMesh(
-                    ObjectType::kBox, cluster, mesh_device);
+        try {
+            candidate.mesh = model.ExtractTriangleMeshIncluding(
+                    config.mesh_weight_threshold, -1, candidate.block_keys);
+        } catch (const std::exception&) {
+            candidate.mesh = t::geometry::TriangleMesh(core::Device("CPU:0"));
+        }
+        candidate.mesh = candidate.mesh.To(core::Device("CPU:0"));
+        if (candidate.mesh.HasVertexPositions() &&
+            candidate.mesh.HasTriangleIndices()) {
+            geometry::TriangleMesh legacy = candidate.mesh.ToLegacy();
+            SanitizeRegionTriangleMesh(legacy, cluster_bounds, max_edge_length,
+                                       bounds_margin,
+                                       config.max_triangle_aspect_ratio);
+            if (legacy.triangles_.empty()) {
+                candidate.mesh = t::geometry::TriangleMesh(core::Device("CPU:0"));
+            } else {
+                candidate.mesh =
+                        t::geometry::TriangleMesh::FromLegacy(legacy);
+            }
         }
     } else {
         candidate.mesh =
                 CreatePrimitiveMesh(candidate.type, cluster, mesh_device);
+        candidate.mesh = candidate.mesh.To(core::Device("CPU:0"));
+        if (candidate.mesh.HasVertexPositions() &&
+            candidate.mesh.HasTriangleIndices()) {
+            geometry::TriangleMesh legacy = candidate.mesh.ToLegacy();
+            SanitizeRegionTriangleMesh(legacy, cluster_bounds, max_edge_length,
+                                       bounds_margin,
+                                       config.max_triangle_aspect_ratio);
+            if (legacy.triangles_.empty()) {
+                candidate.mesh = t::geometry::TriangleMesh(core::Device("CPU:0"));
+            } else {
+                candidate.mesh =
+                        t::geometry::TriangleMesh::FromLegacy(legacy);
+            }
+        }
     }
-    candidate.bounds = cluster.GetAxisAlignedBoundingBox().ToLegacy();
+    candidate.bounds = cluster_bounds;
     candidate.source_cluster = t::geometry::PointCloud();
 }
 
@@ -446,6 +585,11 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
                 SelectCluster(pcd_cpu, labels, cluster_id);
         if (cluster.GetPointPositions().GetLength() <
             config.min_cluster_points) {
+            continue;
+        }
+        const geometry::AxisAlignedBoundingBox cluster_aabb =
+                cluster.ToLegacy().GetAxisAlignedBoundingBox();
+        if (cluster_aabb.GetMaxExtent() > config.max_cluster_extent_m) {
             continue;
         }
         ObjectType type = ClassifyCluster(cluster);
