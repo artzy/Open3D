@@ -192,8 +192,19 @@ inline core::Tensor CollectBlockKeys(
         t::geometry::VoxelBlockGrid& vbg,
         const t::geometry::PointCloud& cluster,
         float trunc_multiplier) {
-    core::Tensor block_coords =
-            vbg.GetUniqueBlockCoordinates(cluster, trunc_multiplier);
+    const core::Device grid_device = vbg.GetHashMap().GetDevice();
+    t::geometry::PointCloud cluster_on_grid = cluster;
+    if (cluster.HasPointPositions() &&
+        cluster.GetPointPositions().GetDevice() != grid_device) {
+        cluster_on_grid = cluster.To(grid_device);
+    }
+    core::Tensor block_coords;
+    try {
+        block_coords = vbg.GetUniqueBlockCoordinates(cluster_on_grid,
+                                                   trunc_multiplier);
+    } catch (const std::exception&) {
+        return core::Tensor({}, core::Int32, core::Device("CPU:0"));
+    }
     if (block_coords.GetLength() == 0) {
         return core::Tensor({}, core::Int32, core::Device("CPU:0"));
     }

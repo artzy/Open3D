@@ -30,6 +30,7 @@ class RealTimeSLAMWindow : public gui::Window {
 public:
     struct DisplayState {
         std::atomic<bool> capture_enabled{true};
+        std::atomic<bool> regions_enabled{false};
         std::atomic<bool> show_region_mesh{true};
         std::atomic<bool> show_region_pcd{true};
 
@@ -209,27 +210,34 @@ public:
         panel_->AddChild(capture_toggle_);
         panel_->AddFixed(vspacing);
 
-        region_mesh_toggle_ =
-                std::make_shared<gui::ToggleSwitch>("Polygon ON/OFF");
-        region_mesh_toggle_->SetOn(true);
-        region_mesh_toggle_->SetOnClicked([this](bool is_on) {
-            state_.show_region_mesh.store(is_on);
-            gui::Application::GetInstance().PostToMainThread(
-                    this, [this]() { ApplyRegionVisibility(); });
-        });
-        panel_->AddChild(region_mesh_toggle_);
-        panel_->AddFixed(vspacing);
+        if (state_.regions_enabled.load()) {
+            region_mesh_toggle_ =
+                    std::make_shared<gui::ToggleSwitch>("Polygon ON/OFF");
+            region_mesh_toggle_->SetOn(true);
+            region_mesh_toggle_->SetOnClicked([this](bool is_on) {
+                state_.show_region_mesh.store(is_on);
+                gui::Application::GetInstance().PostToMainThread(
+                        this, [this]() { ApplyRegionVisibility(); });
+            });
+            panel_->AddChild(region_mesh_toggle_);
+            panel_->AddFixed(vspacing);
 
-        region_pcd_toggle_ =
-                std::make_shared<gui::ToggleSwitch>("Point cloud ON/OFF");
-        region_pcd_toggle_->SetOn(true);
-        region_pcd_toggle_->SetOnClicked([this](bool is_on) {
-            state_.show_region_pcd.store(is_on);
-            gui::Application::GetInstance().PostToMainThread(
-                    this, [this]() { ApplyRegionVisibility(); });
-        });
-        panel_->AddChild(region_pcd_toggle_);
-        panel_->AddFixed(vspacing);
+            region_pcd_toggle_ =
+                    std::make_shared<gui::ToggleSwitch>("Point cloud ON/OFF");
+            region_pcd_toggle_->SetOn(true);
+            region_pcd_toggle_->SetOnClicked([this](bool is_on) {
+                state_.show_region_pcd.store(is_on);
+                gui::Application::GetInstance().PostToMainThread(
+                        this, [this]() { ApplyRegionVisibility(); });
+            });
+            panel_->AddChild(region_pcd_toggle_);
+            panel_->AddFixed(vspacing);
+        } else {
+            auto hint = std::make_shared<gui::Label>(
+                    "Polygon freeze: use --regions");
+            panel_->AddChild(hint);
+            panel_->AddFixed(vspacing);
+        }
 
         status_label_ = std::make_shared<gui::Label>("");
         status_label_->SetFontId(monospace);

@@ -93,3 +93,43 @@ cd d:\study\Open3D\SLAM\bin\Release
 - (b) `regions/region_0.ply`, `regions/regions.json` 생성
 - (c) 뷰 뒤집힘 없음
 - (d) ESC 종료 후 `scene.ply`에 전체 장면 포함
+
+## 폴리곤 미생성 버그 수정 (2026-07-08)
+
+### 증상
+
+`--regions` + GUI `Polygon ON/OFF` 사용 시 freeze된 region mesh가 표시되지 않거나 `regions/` 파일이 생성되지 않음.
+
+### 원인 (복합)
+
+| # | 원인 | 증상 |
+|---|------|------|
+| 1 | Region check가 display refresh(`update_interval`)에 묶여 `region_interval`마다 검사 누락 | segmentation 자체가 간헐적으로만 실행 |
+| 2 | DBSCAN `min_points`에 `min_cluster_points`(2000~5000)를 그대로 사용 | 모든 점이 noise → 클러스터 0개 |
+| 3 | `defer_model_ops=true`일 때 ready 후보 필터가 `mesh.HasVertexPositions()`만 검사 | mesh 없는 후보 전부 폐기 → freeze 경로 미진입 |
+| 4 | segmentation용 surface pcd를 CPU로 옮긴 뒤 CUDA voxel grid에 `GetUniqueBlockCoordinates` 호출 | frame 90에서 `No block is touched in TSDF volume` 예외 → RegionWorker 전체 실패 |
+
+### 수정
+
+- `RealTimeSLAMRealSense.cpp`: region check를 display refresh와 분리, profile별 기본값 완화, per-candidate try/catch
+- `ObjectMeshPipeline.h`:
+  - `dbscan_min_points` 분리 (`min_cluster_points / 100`, 최소 10)
+  - `CollectBlockKeys`: cluster를 voxel grid 디바이스(CUDA)로 이동 후 block lookup
+  - block lookup 실패 시 primitive mesh fallback
+  - `defer_model_ops` 후보 필터에 `source_cluster.HasPointPositions()` 포함
+
+### 검증 (25초, `--regions --profile low --region_interval 30 --region_stability 3`)
+
+로그 (`Analysis/polygon_fix_test5_out.txt`):
+
+```
+Saved region 0 (wall, 226 blocks, 16852 vertices) -> regions/region_0.ply
+Saved region 1 (generic, 139 blocks, 9410 vertices) -> regions/region_1.ply
+Saved region 2 (generic, 109 blocks, 5929 vertices) -> regions/region_2.ply
+Frozen 3 region(s). Total regions: 3.
+Added region 0 pair to scene (mesh: 16852, pcd: 16812).
+...
+Frozen 2 region(s). Total regions: 5.
+```
+
+**참고**: `stability=3`이면 최소 3회 region check(예: frame 30/60/90) 후 freeze. frame 90 이전에는 “waiting for stable cluster” 로그가 정상이다.

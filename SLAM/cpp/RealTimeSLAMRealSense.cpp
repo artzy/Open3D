@@ -88,6 +88,9 @@ SlamParams GetProfile(const std::string& profile) {
         p.estimated_points = 2500000;
         p.depth_max = 2.f;
         p.update_interval = 20;
+        p.regions.min_points = 2000;
+        p.regions.stability_frames = 3;
+        p.regions.interval = 30;
         return p;
     }
     if (profile == "high") {
@@ -98,8 +101,14 @@ SlamParams GetProfile(const std::string& profile) {
         p.odom_iter_coarse = 8;
         p.odom_iter_mid = 4;
         p.odom_iter_fine = 2;
+        p.regions.min_points = 5000;
+        p.regions.stability_frames = 5;
+        p.regions.interval = 60;
         return p;
     }
+    p.regions.min_points = 3000;
+    p.regions.stability_frames = 4;
+    p.regions.interval = 45;
     return p;
 }
 
@@ -214,7 +223,7 @@ bool IsHashNearFull(int64_t hash_size, int64_t hash_capacity) {
 static constexpr int kMaxExtractPoints = 12000000;
 static constexpr int kPointsPerHashBlock = 200;
 static constexpr int kMaxRegionSegmentationPoints = 200000;
-static constexpr double kDbscanEpsMultiplier = 2.0;
+static constexpr double kDbscanEpsMultiplier = 4.0;
 
 int GetExtractPointBudget(int estimated_points, int64_t hash_size) {
     const int64_t hash_based = std::min(
@@ -417,6 +426,11 @@ object_mesh::SegmentationConfig BuildRegionSegmentationConfig(
     config.trunc_multiplier = params.trunc_multiplier;
     config.mesh_weight_threshold = extract_weight;
     config.dbscan_eps = kDbscanEpsMultiplier * params.voxel_size;
+    config.dbscan_min_points =
+            std::max(10, params.regions.min_points / 100);
+    // Live SLAM grows the map between checks; relax matching so stability can accrue.
+    config.centroid_match_eps = std::max(0.25, 10.0 * static_cast<double>(params.voxel_size));
+    config.extent_iou_min = 0.45;
     return config;
 }
 
@@ -586,22 +600,41 @@ void RegionWorker(SlamRuntime& runtime,
                     surface_pcd, *runtime.model, runtime.freeze_tracker,
                     config, runtime.next_object_id);
 
+            if (pending.empty()) {
+                utility::LogInfo(
+                        "Region check frame {}: surface segmented, waiting for "
+                        "stable cluster (tracked {}, frozen {}).",
+                        frame_id, runtime.freeze_tracker.TrackedCount(),
+                        runtime.freeze_tracker.FrozenCount());
+            }
+
             std::vector<object_mesh::FrozenObjectCandidate> frozen_now;
             {
                 std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
                 for (auto& candidate : pending) {
-                    const t::geometry::PointCloud region_cluster =
-                            candidate.source_cluster;
-                    object_mesh::ApplyFreezeAndExtractMesh(
-                            candidate, *runtime.model, config);
-                    if (candidate.mesh.HasVertexPositions()) {
-                        candidate.source_cluster = region_cluster;
-                        frozen_now.push_back(std::move(candidate));
+                    try {
+                        const t::geometry::PointCloud region_cluster =
+                                candidate.source_cluster;
+                        object_mesh::ApplyFreezeAndExtractMesh(
+                                candidate, *runtime.model, config);
+                        if (candidate.mesh.HasVertexPositions()) {
+                            candidate.source_cluster = region_cluster;
+                            frozen_now.push_back(std::move(candidate));
+                        }
+                    } catch (const std::exception& e) {
+                        utility::LogWarning(
+                                "Region freeze skipped for candidate {} at "
+                                "frame {}: {}",
+                                candidate.id, frame_id, e.what());
                     }
                 }
             }
 
             if (frozen_now.empty()) {
+                utility::LogInfo(
+                        "Region check frame {}: {} candidate(s) tracked, none "
+                        "ready to freeze yet.",
+                        frame_id, static_cast<int>(pending.size()));
                 continue;
             }
 
@@ -1168,6 +1201,38 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                     true);
         }
 
+        if (params.regions.enabled &&
+            ShouldCheckRegions(frame_id, params.regions.interval)) {
+            const float region_weight = ExtractWeightThreshold(frame_id);
+            try {
+                t::geometry::PointCloud region_pcd;
+                {
+                    std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
+                    region_pcd = model.ExtractPointCloudExcludingFrozen(
+                            region_weight, kMaxRegionSegmentationPoints);
+                    region_pcd = region_pcd.To(core::Device("CPU:0"));
+                }
+                if (region_pcd.HasPointPositions()) {
+                    const int64_t region_points =
+                            region_pcd.GetPointPositions().GetLength();
+                    {
+                        std::lock_guard<std::mutex> lock(runtime.region_mutex);
+                        runtime.pending_region_pcd = std::move(region_pcd);
+                        runtime.pending_extract_weight = region_weight;
+                        runtime.pending_frame_id = frame_id;
+                        runtime.region_requested.store(true);
+                    }
+                    runtime.region_cv.notify_one();
+                    utility::LogInfo(
+                            "Region segmentation queued at frame {} ({} points).",
+                            frame_id, region_points);
+                }
+            } catch (const std::exception& e) {
+                utility::LogWarning("Region extract skipped at frame {}: {}",
+                                    frame_id, e.what());
+            }
+        }
+
         if (ShouldRefreshDisplay(frame_id, params.update_interval)) {
             const float weight = ExtractWeightThreshold(frame_id);
             const int extract_budget =
@@ -1175,7 +1240,6 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                                           hash_size_before);
             try {
                 t::geometry::PointCloud pcd_t;
-                t::geometry::PointCloud region_pcd;
                 {
                     std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
                     if (params.regions.enabled) {
@@ -1184,26 +1248,11 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                     } else {
                         pcd_t = model.ExtractPointCloud(weight, extract_budget);
                     }
-                    if (params.regions.enabled &&
-                        ShouldCheckRegions(frame_id, params.regions.interval)) {
-                        region_pcd = pcd_t.To(core::Device("CPU:0"));
-                    }
                 }
                 auto pcd =
                         std::make_shared<geometry::PointCloud>(pcd_t.ToLegacy());
                 if (!pcd->IsEmpty()) {
                     state.SetPointCloud(pcd);
-                }
-                if (params.regions.enabled &&
-                    region_pcd.HasPointPositions()) {
-                    {
-                        std::lock_guard<std::mutex> lock(runtime.region_mutex);
-                        runtime.pending_region_pcd = std::move(region_pcd);
-                        runtime.pending_extract_weight = weight;
-                        runtime.pending_frame_id = frame_id;
-                        runtime.region_requested.store(true);
-                    }
-                    runtime.region_cv.notify_one();
                 }
             } catch (const std::exception& e) {
                 utility::LogWarning("Live extract skipped at frame {}: {}",
@@ -1647,6 +1696,7 @@ int main(int argc, char* argv[]) {
     }
 
     DisplayState display_state;
+    display_state.regions_enabled.store(params.regions.enabled);
     std::thread region_thread;
     if (params.regions.enabled) {
         region_thread = std::thread(RegionWorker, std::ref(runtime),

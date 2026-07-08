@@ -66,6 +66,7 @@ struct ClusterSignature {
 
 struct SegmentationConfig {
     double dbscan_eps = 0.01;
+    int dbscan_min_points = 15;
     int min_cluster_points = 5000;
     int stability_frames = 5;
     bool auto_freeze = true;
@@ -191,6 +192,10 @@ public:
         return counts;
     }
 
+    int TrackedCount() const {
+        return static_cast<int>(tracked_clusters_.size());
+    }
+
 private:
     SegmentationConfig config_;
     std::vector<TrackedCluster> tracked_clusters_;
@@ -200,8 +205,19 @@ inline core::Tensor CollectBlockKeys(
         t::geometry::VoxelBlockGrid& vbg,
         const t::geometry::PointCloud& cluster,
         float trunc_multiplier) {
-    core::Tensor block_coords =
-            vbg.GetUniqueBlockCoordinates(cluster, trunc_multiplier);
+    const core::Device grid_device = vbg.GetHashMap().GetDevice();
+    t::geometry::PointCloud cluster_on_grid = cluster;
+    if (cluster.HasPointPositions() &&
+        cluster.GetPointPositions().GetDevice() != grid_device) {
+        cluster_on_grid = cluster.To(grid_device);
+    }
+    core::Tensor block_coords;
+    try {
+        block_coords = vbg.GetUniqueBlockCoordinates(cluster_on_grid,
+                                                   trunc_multiplier);
+    } catch (const std::exception&) {
+        return core::Tensor({}, core::Int32, core::Device("CPU:0"));
+    }
     if (block_coords.GetLength() == 0) {
         return core::Tensor({}, core::Int32, core::Device("CPU:0"));
     }
@@ -365,11 +381,16 @@ inline void ApplyFreezeAndExtractMesh(
         return;
     }
 
-    const core::Device mesh_device =
-            model.voxel_grid_.GetHashMap().GetDevice();
     candidate.block_keys = CollectBlockKeys(model.voxel_grid_, cluster,
                                             config.trunc_multiplier);
+    const core::Device mesh_device =
+            model.voxel_grid_.GetHashMap().GetDevice();
     if (candidate.block_keys.NumElements() == 0) {
+        candidate.mesh = CreatePrimitiveMesh(
+                candidate.type == ObjectType::kGeneric ? ObjectType::kBox
+                                                       : candidate.type,
+                cluster, mesh_device);
+        candidate.bounds = cluster.GetAxisAlignedBoundingBox().ToLegacy();
         return;
     }
 
@@ -404,7 +425,7 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
 
     t::geometry::PointCloud pcd_cpu = surface_pcd.To(core::Device("CPU:0"));
     core::Tensor labels =
-            pcd_cpu.ClusterDBSCAN(config.dbscan_eps, config.min_cluster_points,
+            pcd_cpu.ClusterDBSCAN(config.dbscan_eps, config.dbscan_min_points,
                                   false);
     const int64_t num_points = labels.GetLength();
     int max_label = -1;
@@ -470,7 +491,8 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
     std::vector<FrozenObjectCandidate> ready =
             tracker.Update(signatures, next_object_id, build_candidate);
     for (auto& candidate : ready) {
-        if (candidate.mesh.HasVertexPositions()) {
+        if (candidate.mesh.HasVertexPositions() ||
+            candidate.source_cluster.HasPointPositions()) {
             frozen_now.push_back(std::move(candidate));
         }
     }
