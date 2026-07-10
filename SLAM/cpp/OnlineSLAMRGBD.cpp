@@ -80,6 +80,15 @@ void PrintHelp() {
     utility::LogInfo("                    - To change default dataset (used when");
     utility::LogInfo("                      dataset_path is not set).");
     utility::LogInfo("                      Available options: `lounge` and `bedroom`.");
+    utility::LogInfo("");
+    utility::LogInfo("Region freeze (--regions):");
+    utility::LogInfo("    [--regions]             Detect stable scan regions, freeze");
+    utility::LogInfo("                             TSDF blocks, extract triangle meshes,");
+    utility::LogInfo("                             and save to --region_dir.");
+    utility::LogInfo("    [--region_min_points N] Min cluster points (default: 2000 with --regions).");
+    utility::LogInfo("    [--region_stability N]  Stable frames before freeze (default: 5).");
+    utility::LogInfo("    [--region_interval N]   Region check every N frames (default: 60).");
+    utility::LogInfo("    [--region_dir PATH]     Output directory (default: regions).");
     // clang-format on
     utility::LogInfo("");
 }
@@ -146,6 +155,30 @@ int main(int argc, char* argv[]) {
     core::Device device(device_code);
     utility::LogInfo("Using device {}.", device_code);
 
+    examples::online_slam::RegionSettings region_settings;
+    if (utility::ProgramOptionExists(argc, argv, "--regions")) {
+        region_settings.enabled = true;
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_min_points")) {
+        region_settings.min_points = utility::GetProgramOptionAsInt(
+                argc, argv, "--region_min_points", region_settings.min_points);
+    } else if (region_settings.enabled) {
+        region_settings.min_points = 2000;
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_stability")) {
+        region_settings.stability_frames = utility::GetProgramOptionAsInt(
+                argc, argv, "--region_stability",
+                region_settings.stability_frames);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_interval")) {
+        region_settings.interval = utility::GetProgramOptionAsInt(
+                argc, argv, "--region_interval", region_settings.interval);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_dir")) {
+        region_settings.output_dir = utility::GetProgramOptionAsString(
+                argc, argv, "--region_dir", region_settings.output_dir);
+    }
+
     // Load files
     std::vector<std::string> rgb_files, depth_files;
     std::tie(rgb_files, depth_files) = LoadFilenames(dataset_path);
@@ -185,13 +218,17 @@ int main(int argc, char* argv[]) {
             {"depth_scale", 1000},
             {"gui_update_interval", 3},
             {"update_interval", 100}};
+    if (region_settings.enabled) {
+        default_params["auto_freeze"] = 1;
+    }
 
     auto& app = gui::Application::GetInstance();
     app.Initialize();
     auto mono =
             app.AddFont(gui::FontDescription(gui::FontDescription::MONOSPACE));
     app.AddWindow(std::make_shared<examples::online_slam::ReconstructionWindow>(
-            get_rgbd_image_input, intrinsic_t, default_params, device, mono));
+            get_rgbd_image_input, intrinsic_t, default_params, device, mono,
+            true, region_settings));
     app.Run();
 
     return 0;

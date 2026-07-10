@@ -8,7 +8,11 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <numeric>
 #include <string>
@@ -695,6 +699,174 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
         }
     }
     return frozen_now;
+}
+
+inline t::geometry::PointCloud DownsamplePointCloudIfNeeded(
+        const t::geometry::PointCloud& pcd, int64_t max_points,
+        float voxel_size_hint = 0.0f) {
+    if (!pcd.HasPointPositions()) {
+        return pcd;
+    }
+    const int64_t count = pcd.GetPointPositions().GetLength();
+    if (count <= max_points) {
+        return pcd;
+    }
+    // Voxel downsample is deterministic and keeps cluster signatures stable
+    // across region checks (RandomDownSample breaks DBSCAN tracking).
+    float voxel = voxel_size_hint > 0.0f ? voxel_size_hint : 0.01f;
+    t::geometry::PointCloud down = pcd.VoxelDownSample(voxel);
+    int64_t down_count = down.GetPointPositions().GetLength();
+    constexpr int kMaxVoxelIterations = 12;
+    for (int i = 0; i < kMaxVoxelIterations && down_count > max_points; ++i) {
+        voxel *= 1.25f;
+        down = pcd.VoxelDownSample(voxel);
+        down_count = down.GetPointPositions().GetLength();
+    }
+    if (down_count > max_points) {
+        down = down.RandomDownSample(static_cast<double>(max_points) /
+                                     static_cast<double>(down_count));
+    }
+    return down;
+}
+
+struct RegionParams {
+    bool enabled = false;
+    int min_points = 5000;
+    int stability_frames = 5;
+    int interval = 60;
+    std::string output_dir = "regions";
+};
+
+struct RegionRecord {
+    int id = -1;
+    ObjectType type = ObjectType::kGeneric;
+    geometry::AxisAlignedBoundingBox bounds;
+    int block_count = 0;
+    int vertex_count = 0;
+    int frame_id = 0;
+    std::string timestamp;
+};
+
+inline SegmentationConfig BuildLiveRegionSegmentationConfig(
+        float voxel_size,
+        float trunc_multiplier,
+        float mesh_weight_threshold,
+        int min_cluster_points,
+        int stability_frames,
+        double dbscan_eps_multiplier = 4.0) {
+    SegmentationConfig config;
+    config.auto_freeze = true;
+    config.tsdf_mesh_only = true;
+    config.defer_model_ops = true;
+    config.min_cluster_points = min_cluster_points;
+    config.stability_frames = stability_frames;
+    config.voxel_size = voxel_size;
+    config.trunc_multiplier = trunc_multiplier;
+    config.mesh_weight_threshold = mesh_weight_threshold;
+    config.dbscan_eps = dbscan_eps_multiplier * voxel_size;
+    config.dbscan_min_points = std::max(10, min_cluster_points / 100);
+    config.centroid_match_eps =
+            std::max(0.25, 10.0 * static_cast<double>(voxel_size));
+    config.extent_iou_min = 0.45;
+    return config;
+}
+
+inline void ClampVertexColors(geometry::TriangleMesh& mesh) {
+    for (auto& c : mesh.vertex_colors_) {
+        c = c.cwiseMax(Eigen::Vector3d::Zero())
+                    .cwiseMin(Eigen::Vector3d::Ones());
+    }
+}
+
+inline std::string CurrentTimestampIso8601() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf{};
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+    return std::string(buffer);
+}
+
+inline void WriteRegionsJson(const std::string& output_dir,
+                             const std::vector<RegionRecord>& records) {
+    const std::string json_path = output_dir + "/regions.json";
+    std::ofstream out(json_path, std::ios::binary);
+    if (!out) {
+        utility::LogWarning("Failed to open {} for writing.", json_path);
+        return;
+    }
+
+    out << "{\n";
+    out << "  \"region_count\": " << records.size() << ",\n";
+    out << "  \"regions\": [\n";
+    for (size_t i = 0; i < records.size(); ++i) {
+        const auto& record = records[i];
+        out << "    {\n";
+        out << "      \"id\": " << record.id << ",\n";
+        out << "      \"type\": \"" << ObjectTypeName(record.type) << "\",\n";
+        out << "      \"frame_id\": " << record.frame_id << ",\n";
+        out << "      \"timestamp\": \"" << record.timestamp << "\",\n";
+        out << "      \"block_count\": " << record.block_count << ",\n";
+        out << "      \"vertex_count\": " << record.vertex_count << ",\n";
+        out << "      \"aabb\": {\n";
+        out << "        \"min\": [" << record.bounds.min_bound_.x() << ", "
+            << record.bounds.min_bound_.y() << ", "
+            << record.bounds.min_bound_.z() << "],\n";
+        out << "        \"max\": [" << record.bounds.max_bound_.x() << ", "
+            << record.bounds.max_bound_.y() << ", "
+            << record.bounds.max_bound_.z() << "]\n";
+        out << "      },\n";
+        out << "      \"mesh_file\": \"region_" << record.id << ".ply\"\n";
+        out << "    }";
+        if (i + 1 < records.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
+inline bool SaveFrozenRegion(const RegionParams& region_params,
+                             const FrozenObjectCandidate& candidate,
+                             int frame_id,
+                             RegionRecord& record_out) {
+    if (!candidate.mesh.HasVertexPositions()) {
+        return false;
+    }
+
+    utility::filesystem::MakeDirectoryHierarchy(region_params.output_dir);
+
+    const std::string mesh_path = region_params.output_dir + "/region_" +
+                                  std::to_string(candidate.id) + ".ply";
+    auto legacy_mesh =
+            std::make_shared<geometry::TriangleMesh>(candidate.mesh.ToLegacy());
+    ClampVertexColors(*legacy_mesh);
+    if (!io::WriteTriangleMesh(mesh_path, *legacy_mesh)) {
+        utility::LogWarning("Failed to save region mesh: {}", mesh_path);
+        return false;
+    }
+
+    record_out.id = candidate.id;
+    record_out.type = candidate.type;
+    record_out.bounds = candidate.bounds;
+    record_out.block_count =
+            static_cast<int>(candidate.block_keys.NumElements() / 3);
+    record_out.vertex_count =
+            static_cast<int>(legacy_mesh->vertices_.size());
+    record_out.frame_id = frame_id;
+    record_out.timestamp = CurrentTimestampIso8601();
+
+    utility::LogInfo(
+            "Saved region {} ({}, {} blocks, {} vertices) -> {}",
+            record_out.id, ObjectTypeName(record_out.type),
+            record_out.block_count, record_out.vertex_count, mesh_path);
+    return true;
 }
 
 }  // namespace object_mesh

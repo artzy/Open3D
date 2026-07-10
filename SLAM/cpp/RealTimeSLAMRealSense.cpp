@@ -62,24 +62,6 @@ namespace realtime_slam = open3d::examples::realtime_slam;
 namespace relocalization = open3d::examples::relocalization;
 using DisplayState = realtime_slam::RealTimeSLAMWindow::DisplayState;
 
-struct RegionParams {
-    bool enabled = false;
-    int min_points = 5000;
-    int stability_frames = 5;
-    int interval = 60;
-    std::string output_dir = "regions";
-};
-
-struct RegionRecord {
-    int id = -1;
-    object_mesh::ObjectType type = object_mesh::ObjectType::kGeneric;
-    geometry::AxisAlignedBoundingBox bounds;
-    int block_count = 0;
-    int vertex_count = 0;
-    int frame_id = 0;
-    std::string timestamp;
-};
-
 struct SlamParams {
     float voxel_size = 3.f / 512.f;
     float trunc_multiplier = 8.f;
@@ -92,7 +74,7 @@ struct SlamParams {
     int odom_iter_coarse = 6;
     int odom_iter_mid = 3;
     int odom_iter_fine = 2;
-    RegionParams regions;
+    object_mesh::RegionParams regions;
 };
 
 SlamParams GetProfile(const std::string& profile) {
@@ -248,13 +230,6 @@ int GetExtractPointBudget(int estimated_points, int64_t hash_size) {
                                      hash_based));
 }
 
-void ClampVertexColors(geometry::TriangleMesh& mesh) {
-    for (auto& c : mesh.vertex_colors_) {
-        c = c.cwiseMax(Eigen::Vector3d::Zero())
-                    .cwiseMin(Eigen::Vector3d::Ones());
-    }
-}
-
 void ClampPointColors(geometry::PointCloud& pcd) {
     for (auto& c : pcd.colors_) {
         c = c.cwiseMax(Eigen::Vector3d::Zero())
@@ -402,51 +377,12 @@ bool ShouldCheckRegions(int frame_id, int region_interval) {
     return frame_id > 0 && frame_id % region_interval == 0;
 }
 
-std::string CurrentTimestampIso8601() {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm_buf{};
-#if defined(_WIN32)
-    localtime_s(&tm_buf, &t);
-#else
-    localtime_r(&t, &tm_buf);
-#endif
-    char buffer[32];
-    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &tm_buf);
-    return std::string(buffer);
-}
-
-t::geometry::PointCloud DownsamplePointCloudIfNeeded(
-        const t::geometry::PointCloud& pcd, int64_t max_points) {
-    if (!pcd.HasPointPositions()) {
-        return pcd;
-    }
-    const int64_t count = pcd.GetPointPositions().GetLength();
-    if (count <= max_points) {
-        return pcd;
-    }
-    return pcd.RandomDownSample(static_cast<double>(max_points) /
-                                static_cast<double>(count));
-}
-
 object_mesh::SegmentationConfig BuildRegionSegmentationConfig(
         const SlamParams& params, float extract_weight) {
-    object_mesh::SegmentationConfig config;
-    config.auto_freeze = true;
-    config.tsdf_mesh_only = true;
-    config.defer_model_ops = true;
-    config.min_cluster_points = params.regions.min_points;
-    config.stability_frames = params.regions.stability_frames;
-    config.voxel_size = params.voxel_size;
-    config.trunc_multiplier = params.trunc_multiplier;
-    config.mesh_weight_threshold = extract_weight;
-    config.dbscan_eps = kDbscanEpsMultiplier * params.voxel_size;
-    config.dbscan_min_points =
-            std::max(10, params.regions.min_points / 100);
-    // Live SLAM grows the map between checks; relax matching so stability can accrue.
-    config.centroid_match_eps = std::max(0.25, 10.0 * static_cast<double>(params.voxel_size));
-    config.extent_iou_min = 0.45;
-    return config;
+    return object_mesh::BuildLiveRegionSegmentationConfig(
+            params.voxel_size, params.trunc_multiplier, extract_weight,
+            params.regions.min_points, params.regions.stability_frames,
+            kDbscanEpsMultiplier);
 }
 
 struct SlamRuntime {
@@ -466,7 +402,7 @@ struct SlamRuntime {
             object_mesh::SegmentationConfig{}};
     int next_object_id = 0;
     std::mutex records_mutex;
-    std::vector<RegionRecord> region_records;
+    std::vector<object_mesh::RegionRecord> region_records;
 
     relocalization::RelocalizationConfig reloc_config;
 
@@ -497,85 +433,6 @@ core::Tensor ApplyPoseDrift(const core::Tensor& T,
     return core::eigen_converter::EigenMatrixToTensor(pose * drift);
 }
 
-void WriteRegionsJson(const std::string& output_dir,
-                      const std::vector<RegionRecord>& records) {
-    const std::string json_path = output_dir + "/regions.json";
-    std::ofstream out(json_path, std::ios::binary);
-    if (!out) {
-        utility::LogWarning("Failed to open {} for writing.", json_path);
-        return;
-    }
-
-    out << "{\n";
-    out << "  \"region_count\": " << records.size() << ",\n";
-    out << "  \"regions\": [\n";
-    for (size_t i = 0; i < records.size(); ++i) {
-        const auto& record = records[i];
-        out << "    {\n";
-        out << "      \"id\": " << record.id << ",\n";
-        out << "      \"type\": \"" << object_mesh::ObjectTypeName(record.type)
-            << "\",\n";
-        out << "      \"frame_id\": " << record.frame_id << ",\n";
-        out << "      \"timestamp\": \"" << record.timestamp << "\",\n";
-        out << "      \"block_count\": " << record.block_count << ",\n";
-        out << "      \"vertex_count\": " << record.vertex_count << ",\n";
-        out << "      \"aabb\": {\n";
-        out << "        \"min\": [" << record.bounds.min_bound_.x() << ", "
-            << record.bounds.min_bound_.y() << ", "
-            << record.bounds.min_bound_.z() << "],\n";
-        out << "        \"max\": [" << record.bounds.max_bound_.x() << ", "
-            << record.bounds.max_bound_.y() << ", "
-            << record.bounds.max_bound_.z() << "]\n";
-        out << "      },\n";
-        out << "      \"mesh_file\": \"region_" << record.id << ".ply\"\n";
-        out << "    }";
-        if (i + 1 < records.size()) {
-            out << ",";
-        }
-        out << "\n";
-    }
-    out << "  ]\n";
-    out << "}\n";
-    out.close();
-}
-
-bool SaveFrozenRegion(const RegionParams& region_params,
-                      const object_mesh::FrozenObjectCandidate& candidate,
-                      int frame_id,
-                      RegionRecord& record_out) {
-    if (!candidate.mesh.HasVertexPositions()) {
-        return false;
-    }
-
-    utility::filesystem::MakeDirectoryHierarchy(region_params.output_dir);
-
-    const std::string mesh_path = region_params.output_dir + "/region_" +
-                                  std::to_string(candidate.id) + ".ply";
-    auto legacy_mesh =
-            std::make_shared<geometry::TriangleMesh>(candidate.mesh.ToLegacy());
-    ClampVertexColors(*legacy_mesh);
-    if (!io::WriteTriangleMesh(mesh_path, *legacy_mesh)) {
-        utility::LogWarning("Failed to save region mesh: {}", mesh_path);
-        return false;
-    }
-
-    record_out.id = candidate.id;
-    record_out.type = candidate.type;
-    record_out.bounds = candidate.bounds;
-    record_out.block_count =
-            static_cast<int>(candidate.block_keys.NumElements() / 3);
-    record_out.vertex_count =
-            static_cast<int>(legacy_mesh->vertices_.size());
-    record_out.frame_id = frame_id;
-    record_out.timestamp = CurrentTimestampIso8601();
-
-    utility::LogInfo(
-            "Saved region {} ({}, {} blocks, {} vertices) -> {}",
-            record_out.id, object_mesh::ObjectTypeName(record_out.type),
-            record_out.block_count, record_out.vertex_count, mesh_path);
-    return true;
-}
-
 void RegionWorker(SlamRuntime& runtime,
                   const SlamParams& params,
                   DisplayState& state) {
@@ -604,8 +461,9 @@ void RegionWorker(SlamRuntime& runtime,
         }
 
         try {
-            surface_pcd = DownsamplePointCloudIfNeeded(
-                    surface_pcd, kMaxRegionSegmentationPoints);
+            surface_pcd = object_mesh::DownsamplePointCloudIfNeeded(
+                    surface_pcd, kMaxRegionSegmentationPoints,
+                    params.voxel_size);
             object_mesh::SegmentationConfig config =
                     BuildRegionSegmentationConfig(params, extract_weight);
             runtime.freeze_tracker.SetConfig(config);
@@ -659,9 +517,9 @@ void RegionWorker(SlamRuntime& runtime,
             {
                 std::lock_guard<std::mutex> lock(runtime.records_mutex);
                 for (auto& candidate : frozen_now) {
-                    RegionRecord record;
-                    if (!SaveFrozenRegion(params.regions, candidate, frame_id,
-                                          record)) {
+                    object_mesh::RegionRecord record;
+                    if (!object_mesh::SaveFrozenRegion(params.regions, candidate,
+                                                       frame_id, record)) {
                         continue;
                     }
                     runtime.region_records.push_back(record);
@@ -672,7 +530,7 @@ void RegionWorker(SlamRuntime& runtime,
                         MeshTriangleCount(candidate.mesh) > 0) {
                         pair.mesh = std::make_shared<geometry::TriangleMesh>(
                                 candidate.mesh.ToLegacy());
-                        ClampVertexColors(*pair.mesh);
+                        object_mesh::ClampVertexColors(*pair.mesh);
                     }
                     if (candidate.source_cluster.HasPointPositions()) {
                         pair.pcd = std::make_shared<geometry::PointCloud>(
@@ -681,7 +539,7 @@ void RegionWorker(SlamRuntime& runtime,
                     }
                     state.PushRegionPair(std::move(pair));
                 }
-                WriteRegionsJson(params.regions.output_dir,
+                object_mesh::WriteRegionsJson(params.regions.output_dir,
                                  runtime.region_records);
                 total_regions = static_cast<int>(runtime.region_records.size());
             }
@@ -1430,7 +1288,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
 
         auto final_mesh =
                 std::make_shared<geometry::TriangleMesh>(final_mesh_t.ToLegacy());
-        ClampVertexColors(*final_mesh);
+        object_mesh::ClampVertexColors(*final_mesh);
         io::WriteTriangleMesh("scene_mesh.ply", *final_mesh);
         utility::LogInfo("Saved scene_mesh.ply ({} vertices).",
                          final_mesh->vertices_.size());
@@ -1440,7 +1298,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
 
     if (params.regions.enabled) {
         std::lock_guard<std::mutex> lock(runtime.records_mutex);
-        WriteRegionsJson(params.regions.output_dir, runtime.region_records);
+        object_mesh::WriteRegionsJson(params.regions.output_dir, runtime.region_records);
         utility::LogInfo("Saved {} region record(s) to {}/regions.json.",
                          runtime.region_records.size(),
                          params.regions.output_dir);

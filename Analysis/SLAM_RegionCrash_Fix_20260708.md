@@ -29,18 +29,54 @@
 
 `ApplyFreezeAndExtractMesh` → `ExtractTriangleMeshIncluding`이 **클러스터 블록만** 대상으로 marching cubes를 실행할 때, 이웃 블록이 `inverse_index_map`에 없어 CUDA 커널이 잘못된 인덱스로 mesh structure에 접근 → illegal memory access.
 
-## 수정
+## 수정 (RealTimeSLAMRealSense)
 
 1. **`ObjectMeshPipeline.h`**: `ExpandBlockKeysForMeshExtract()` — mesh 추출 전 블록 키 3×3×3 halo 확장
 2. **`RealTimeSLAMRealSense.cpp`**: region point extract `-1` (2-pass), `UpdateFramePose`를 `model_mutex` 안 integrate와 묶음
+
+## OnlineSLAMRGBD region polygon 이식 (2026-07-10)
+
+RealTime과 동일 UX: `--regions`, `--region_interval`, `--region_stability`, `--region_min_points`, `--region_dir`.
+
+### 변경 파일
+
+| 파일 | 내용 |
+|------|------|
+| `ObjectMeshPipeline.h` | `BuildLiveRegionSegmentationConfig`, `RegionParams`, `SaveFrozenRegion`, `WriteRegionsJson`, voxel 기반 `DownsamplePointCloudIfNeeded` |
+| `RealTimeSLAMRealSense.cpp` | 공용 config/저장 함수 사용 |
+| `OnlineSLAMUtil.h` | `RegionSettings`, RegionWorker 패턴 `SegmentationWorker`, extract `-1`, mutex 내 `UpdateFramePose`, GUI regions 표시, 종료 시 `regions.json` |
+| `OnlineSLAMRGBD.cpp` | CLI, `--regions` 시 `auto_freeze=1`, `min_points` 기본 2000 |
+
+### file playback(lounge) 보정
+
+데이터셋 재생은 초기 프레임부터 전체 장면이 빠르게 통합되어 RealTime 라이브 스캔과 extract 규모가 다름. 추가 조정:
+
+- **`RegionExtractWeightThreshold`**: RealTime과 동일하게 weight ≥ 1.0 (GUI용 낮은 threshold와 분리)
+- **voxel downsample**: region DBSCAN 입력을 deterministic하게 유지 (RandomDownSample은 클러스터 추적 불안정)
+- **file playback matching 완화**: `centroid_match_eps`, `extent_iou_min`, `max_cluster_extent_m` 완화
+
+### 검증 결과
+
+| 테스트 | 조건 | 결과 |
+|--------|------|------|
+| regions on | `OnlineSLAMRGBD --default_dataset lounge --regions --region_interval 30 --region_stability 3`, 120s | `regions/region_0.ply` + `regions.json` 생성, CUDA error 없음 |
+| regions off | `OnlineSLAMRGBD --default_dataset lounge`, 35s+ | 정상 실행, CUDA error 없음 |
+
+로그: `Analysis/online_rgbd_regions_test6_out.txt`, `Analysis/online_rgbd_noregions_test_out.txt`
 
 ## 검증 명령 (PowerShell)
 
 ```powershell
 cd d:\study\Open3D\SLAM\bin\Release
+
+# RealTime
 .\RealTimeSLAMRealSense.exe --regions --profile low --region_interval 30 --region_stability 3
+
+# OnlineSLAMRGBD
+.\OnlineSLAMRGBD.exe --default_dataset lounge --regions --region_interval 30 --region_stability 3
+.\OnlineSLAMRGBD.exe --default_dataset lounge
 ```
 
-130초 이상 실행 후 `regions/region_*.ply` 생성 및 CUDA error 없음을 확인.
+130초(또는 lounge EOF) 이상 실행 후 `regions/region_*.ply` 생성 및 CUDA error 없음을 확인.
 
-**상태:** 사용자 재현 확인 완료 (2026-07-08). 디버그 instrumentation 제거됨.
+**상태:** RealTime 사용자 재현 확인 완료 (2026-07-08). OnlineSLAMRGBD lounge 테스트 완료 (2026-07-10).

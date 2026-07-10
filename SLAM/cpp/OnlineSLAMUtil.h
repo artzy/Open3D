@@ -261,6 +261,8 @@ private:
     }
 };
 
+struct RegionSettings : public object_mesh::RegionParams {};
+
 class ReconstructionWindow : public gui::Window {
     using Super = gui::Window;
 
@@ -272,7 +274,8 @@ public:
             const std::unordered_map<std::string, double> default_parameters,
             const core::Device device,
             gui::FontId monospace,
-            bool exit_on_empty_frame = true)
+            bool exit_on_empty_frame = true,
+            RegionSettings region_settings = {})
         : gui::Window("Open3D - Reconstruction", 2560, 1600),
           get_rgbd_image_input_(get_rgbd_image_input),
           intrinsic_(intrinsic),
@@ -281,6 +284,7 @@ public:
           is_running_(false),
           is_started_(false),
           exit_on_empty_frame_(exit_on_empty_frame),
+          region_settings_(std::move(region_settings)),
           monospace_(monospace) {
         ////////////////////////////////////////
         /// General layout
@@ -332,6 +336,9 @@ public:
             default_param["gui_update_interval"] = 3;
             default_param["update_interval"] = 100;
             default_param["raycast_color"] = 0;
+        }
+        if (region_settings_.enabled) {
+            default_param["auto_freeze"] = 1;
         }
 
         fixed_props_ = std::make_shared<PropertyPanel>(spacing, left_margin);
@@ -405,7 +412,9 @@ public:
         adjustable_props_->AddBool(
                 "Auto freeze", &prop_values_.auto_freeze,
                 default_param.at("auto_freeze") > 0.5,
-                "Automatically freeze stable clusters as mesh assets.");
+                region_settings_.enabled
+                        ? "Region mode: polygon freeze is always enabled."
+                        : "Automatically freeze stable clusters as mesh assets.");
         adjustable_props_->AddIntSlider(
                 "Stability frames", &prop_values_.stability_frames,
                 static_cast<int>(default_param.at("stability_frames")), 2, 20,
@@ -493,7 +502,7 @@ public:
                             "Failed to save scene.ply: {}", e.what());
                 }
 
-                if (!frozen_objects_.empty()) {
+                if (!region_settings_.enabled && !frozen_objects_.empty()) {
                     utility::filesystem::MakeDirectoryHierarchy("objects");
                     std::ofstream blocks_json("objects/frozen_blocks.json");
                     blocks_json << "{\n  \"objects\": [\n";
@@ -542,6 +551,16 @@ public:
                     utility::LogInfo(
                             "Saved {} frozen object meshes to objects/.",
                             frozen_objects_.size());
+                }
+
+                if (region_settings_.enabled) {
+                    std::lock_guard<std::mutex> lock(region_records_mutex_);
+                    object_mesh::WriteRegionsJson(region_settings_.output_dir,
+                                                  region_records_);
+                    utility::LogInfo(
+                            "Saved {} region record(s) to {}/regions.json.",
+                            region_records_.size(),
+                            region_settings_.output_dir);
                 }
 
                 utility::LogInfo("Writing trajectory to trajectory.log...");
@@ -711,6 +730,12 @@ protected:
     std::condition_variable segmentation_cv_;
     std::atomic<bool> segmentation_requested_{false};
     t::geometry::PointCloud pending_segmentation_pcd_;
+    int pending_segmentation_frame_id_ = 0;
+    float pending_segmentation_extract_weight_ = 3.0f;
+
+    RegionSettings region_settings_;
+    std::vector<object_mesh::RegionRecord> region_records_;
+    std::mutex region_records_mutex_;
 
     std::vector<t::pipelines::odometry::OdometryConvergenceCriteria>
     BuildOdometryCriteria() {
@@ -741,6 +766,53 @@ protected:
         config.dbscan_eps = prop_values_.dbscan_eps_multiplier.load() *
                               prop_values_.voxel_size.load();
         return config;
+    }
+
+    object_mesh::SegmentationConfig BuildRegionSegmentationConfig(
+            float extract_weight) const {
+        object_mesh::SegmentationConfig config =
+                object_mesh::BuildLiveRegionSegmentationConfig(
+                        static_cast<float>(prop_values_.voxel_size.load()),
+                        static_cast<float>(prop_values_.trunc_multiplier.load()),
+                        extract_weight, region_settings_.min_points,
+                        region_settings_.stability_frames, 4.0);
+        if (exit_on_empty_frame_) {
+            // Dataset playback integrates the full scene quickly; relax matching
+            // so cluster signatures stay stable while the map still refines.
+            config.centroid_match_eps = std::max(
+                    0.5, 30.0 * static_cast<double>(config.voxel_size));
+            config.extent_iou_min = 0.30;
+            config.max_cluster_extent_m = 2.5;
+        }
+        return config;
+    }
+
+    bool ShouldCheckRegions(int frame_id) const {
+        return region_settings_.enabled && frame_id > 0 &&
+               frame_id % region_settings_.interval == 0;
+    }
+
+    static float ExtractWeightThreshold(int frame_id) {
+        return std::min(3.f, std::max(0.5f, static_cast<float>(frame_id) * 0.01f));
+    }
+
+    /// Match RealTimeSLAMRealSense region extract: higher weight avoids
+    /// segmenting the entire map on early file-playback frames.
+    static float RegionExtractWeightThreshold(int frame_id) {
+        return std::max(1.0f, std::min(static_cast<float>(frame_id), 3.0f));
+    }
+
+    void QueueSegmentationCloud(t::geometry::PointCloud region_pcd,
+                                int frame_id,
+                                float extract_weight) {
+        {
+            std::lock_guard<std::mutex> lock(segmentation_mutex_);
+            pending_segmentation_pcd_ = std::move(region_pcd);
+            pending_segmentation_frame_id_ = frame_id;
+            pending_segmentation_extract_weight_ = extract_weight;
+            segmentation_requested_ = true;
+        }
+        segmentation_cv_.notify_one();
     }
 
     // SLAM/RGB-D world uses +Y down (camera convention). SetupCamera applies
@@ -790,7 +862,9 @@ protected:
             if (scene->HasGeometry(name)) {
                 scene->RemoveGeometry(name);
             }
-            scene->AddGeometry(name, obj.mesh, mesh_mat);
+            geometry::TriangleMesh legacy_mesh = obj.mesh.ToLegacy();
+            object_mesh::ClampVertexColors(legacy_mesh);
+            scene->AddGeometry(name, legacy_mesh, mesh_mat);
         }
     }
 
@@ -810,6 +884,8 @@ protected:
     void SegmentationWorker() {
         while (!is_done_) {
             t::geometry::PointCloud segmentation_pcd;
+            int frame_id = 0;
+            float extract_weight = 3.0f;
             {
                 std::unique_lock<std::mutex> lock(segmentation_mutex_);
                 segmentation_cv_.wait(lock, [this]() {
@@ -820,6 +896,8 @@ protected:
                 }
                 segmentation_requested_ = false;
                 segmentation_pcd = pending_segmentation_pcd_;
+                frame_id = pending_segmentation_frame_id_;
+                extract_weight = pending_segmentation_extract_weight_;
             }
 
             if (!is_started_ || !model_ || segmentation_pcd.IsEmpty()) {
@@ -827,8 +905,103 @@ protected:
             }
 
             try {
-                segmentation_pcd = DownsamplePointCloudIfNeeded(
-                        segmentation_pcd, kMaxSegmentationPoints);
+                segmentation_pcd = object_mesh::DownsamplePointCloudIfNeeded(
+                        segmentation_pcd, kMaxSegmentationPoints,
+                        static_cast<float>(prop_values_.voxel_size.load()));
+
+                if (region_settings_.enabled) {
+                    object_mesh::SegmentationConfig config =
+                            BuildRegionSegmentationConfig(extract_weight);
+                    freeze_tracker_.SetConfig(config);
+
+                    std::vector<object_mesh::FrozenObjectCandidate> ready;
+                    ready = object_mesh::ProcessExtractedSurface(
+                            segmentation_pcd, *model_, freeze_tracker_, config,
+                            next_object_id_);
+
+                    if (ready.empty()) {
+                        utility::LogInfo(
+                                "Region check frame {}: surface segmented, "
+                                "waiting for stable cluster (tracked {}, "
+                                "frozen {}).",
+                                frame_id, freeze_tracker_.TrackedCount(),
+                                freeze_tracker_.FrozenCount());
+                    }
+
+                    std::vector<object_mesh::FrozenObjectCandidate> frozen_now;
+                    for (auto& candidate : ready) {
+                        const t::geometry::PointCloud region_cluster =
+                                candidate.source_cluster;
+                        try {
+                            {
+                                std::lock_guard<std::mutex> model_lock(
+                                        model_mutex_);
+                                object_mesh::ApplyFreezeAndExtractMesh(
+                                        candidate, *model_, config);
+                            }
+                            if (candidate.mesh.HasVertexPositions() ||
+                                region_cluster.HasPointPositions()) {
+                                candidate.source_cluster = region_cluster;
+                                frozen_now.push_back(std::move(candidate));
+                            }
+                        } catch (const std::exception& e) {
+                            utility::LogWarning(
+                                    "Region freeze skipped for candidate {} "
+                                    "at frame {}: {}",
+                                    candidate.id, frame_id, e.what());
+                        }
+                    }
+
+                    if (frozen_now.empty()) {
+                        utility::LogInfo(
+                                "Region check frame {}: {} candidate(s) "
+                                "tracked, none ready to freeze yet.",
+                                frame_id, static_cast<int>(ready.size()));
+                        continue;
+                    }
+
+                    std::vector<FrozenObjectEntry> new_objects;
+                    {
+                        std::lock_guard<std::mutex> lock(region_records_mutex_);
+                        for (auto& candidate : frozen_now) {
+                            object_mesh::RegionRecord record;
+                            if (!object_mesh::SaveFrozenRegion(
+                                        region_settings_, candidate, frame_id,
+                                        record)) {
+                                continue;
+                            }
+                            region_records_.push_back(record);
+
+                            FrozenObjectEntry entry;
+                            entry.id = candidate.id;
+                            entry.type = candidate.type;
+                            entry.mesh = std::move(candidate.mesh);
+                            entry.block_keys = candidate.block_keys;
+                            new_objects.push_back(std::move(entry));
+                        }
+                        object_mesh::WriteRegionsJson(region_settings_.output_dir,
+                                                      region_records_);
+                    }
+
+                    if (!new_objects.empty()) {
+                        {
+                            std::lock_guard<std::mutex> lock(frozen_mutex_);
+                            for (auto& entry : new_objects) {
+                                frozen_objects_.push_back(entry);
+                            }
+                        }
+                        frozen_version_.fetch_add(1);
+                        utility::LogInfo(
+                                "Frozen {} region(s). Total regions: {}.",
+                                new_objects.size(), region_records_.size());
+                        gui::Application::GetInstance().PostToMainThread(
+                                this, [this, new_objects]() {
+                                    AddFrozenMeshesToScene(new_objects);
+                                });
+                    }
+                    continue;
+                }
+
                 object_mesh::SegmentationConfig config =
                         BuildSegmentationConfig();
                 freeze_tracker_.SetConfig(config);
@@ -907,7 +1080,8 @@ protected:
                             extracted, kMaxRenderPoints);
                     surface_.version.fetch_add(1);
                 }
-                if (prop_values_.auto_freeze.load()) {
+                if (prop_values_.auto_freeze.load() &&
+                    !region_settings_.enabled) {
                     t::geometry::PointCloud segmentation_copy;
                     {
                         std::lock_guard<std::mutex> locker(surface_.lock);
@@ -1017,6 +1191,16 @@ protected:
                 est_points * 16 / (1024 * 1024), est_points);
         utility::LogInfo("SLAM hash capacity: {}/{} blocks.",
                         model_->GetHashMap().Size(), hash_cap);
+        if (region_settings_.enabled) {
+            utility::filesystem::MakeDirectoryHierarchy(
+                    region_settings_.output_dir);
+            utility::LogInfo(
+                    "Region freeze enabled: min_points={}, stability={}, "
+                    "interval={}, dir={}",
+                    region_settings_.min_points,
+                    region_settings_.stability_frames,
+                    region_settings_.interval, region_settings_.output_dir);
+        }
         is_started_ = true;
     }
 
@@ -1323,10 +1507,10 @@ protected:
                 tracking_tier = TrackingTier::kFail;
             }
 
-            model_->UpdateFramePose(idx, T_frame_to_model);
             const bool integrated = tracking_success;
             {
                 std::lock_guard<std::mutex> model_lock(model_mutex_);
+                model_->UpdateFramePose(idx, T_frame_to_model);
                 if (integrated && !hash_near_full) {
                     model_->Integrate(input_frame, depth_scale,
                                       prop_values_.depth_max,
@@ -1373,6 +1557,36 @@ protected:
                     prop_values_.update_surface && idx > 0 &&
                     (idx == first_extract_frame ||
                      idx % effective_interval == 0);
+
+            if (ShouldCheckRegions(static_cast<int>(idx))) {
+                const float region_weight = RegionExtractWeightThreshold(
+                        static_cast<int>(idx));
+                try {
+                    t::geometry::PointCloud region_pcd;
+                    {
+                        std::lock_guard<std::mutex> model_lock(model_mutex_);
+                        region_pcd = model_->ExtractPointCloudExcludingFrozen(
+                                region_weight, -1);
+                        region_pcd = region_pcd.To(core::Device("CPU:0"));
+                    }
+                    if (region_pcd.HasPointPositions()) {
+                        const int64_t region_points =
+                                region_pcd.GetPointPositions().GetLength();
+                        QueueSegmentationCloud(std::move(region_pcd),
+                                               static_cast<int>(idx),
+                                               region_weight);
+                        utility::LogInfo(
+                                "Region segmentation queued at frame {} ({} "
+                                "points).",
+                                idx, region_points);
+                    }
+                } catch (const std::exception& e) {
+                    utility::LogWarning(
+                            "Region extract skipped at frame {}: {}", idx,
+                            e.what());
+                }
+            }
+
             if (should_request_extract) {
                 constexpr float kExtractWeightThreshold = 3.0f;
                 const int extract_budget = GetLiveExtractBudget(
@@ -1407,6 +1621,10 @@ protected:
                 if (hash_near_full) {
                     info << "Hash map nearly full: integration paused.\n";
                 }
+                if (region_settings_.enabled) {
+                    std::lock_guard<std::mutex> lock(region_records_mutex_);
+                    info << fmt::format("Regions: {}\n", region_records_.size());
+                }
                 if (consecutive_tracking_failures_ > 5) {
                     info << fmt::format(
                             "Tracking lost: {} frames. Move slowly back to the "
@@ -1426,24 +1644,29 @@ protected:
                 {
                     std::lock_guard<std::mutex> lock(frozen_mutex_);
                     if (!frozen_objects_.empty()) {
-                        std::unordered_map<object_mesh::ObjectType, int>
-                                type_counts;
-                        for (const auto& obj : frozen_objects_) {
-                            ++type_counts[obj.type];
-                        }
-                        info << fmt::format("Frozen objects: {} (",
-                                            frozen_objects_.size());
-                        bool first = true;
-                        for (const auto& [type, count] : type_counts) {
-                            if (!first) {
-                                info << ", ";
+                        if (region_settings_.enabled) {
+                            info << fmt::format("Region meshes in scene: {}\n",
+                                                frozen_objects_.size());
+                        } else {
+                            std::unordered_map<object_mesh::ObjectType, int>
+                                    type_counts;
+                            for (const auto& obj : frozen_objects_) {
+                                ++type_counts[obj.type];
                             }
-                            info << fmt::format("{}×{}", count,
-                                                object_mesh::ObjectTypeName(
-                                                        type));
-                            first = false;
+                            info << fmt::format("Frozen objects: {} (",
+                                                frozen_objects_.size());
+                            bool first = true;
+                            for (const auto& [type, count] : type_counts) {
+                                if (!first) {
+                                    info << ", ";
+                                }
+                                info << fmt::format("{}×{}", count,
+                                                    object_mesh::ObjectTypeName(
+                                                            type));
+                                first = false;
+                            }
+                            info << ")\n";
                         }
-                        info << ")\n";
                     }
                 }
                 info << "\n";
