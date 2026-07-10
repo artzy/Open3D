@@ -91,6 +91,8 @@ struct SegmentationConfig {
     double cluster_outlier_std_ratio = 2.0;
     double max_cluster_extent_m = 1.2;
     double max_triangle_aspect_ratio = 20.0;
+    /// Block-grid dilation for freeze/mesh extract; 0 = auto from trunc_multiplier.
+    int region_seam_block_radius = 0;
 };
 
 struct RegionMeshSanitizeStats {
@@ -327,26 +329,28 @@ struct BlockKey3Hash {
     }
 };
 
-/// Marching-cubes mesh extract needs a 1-block halo; partial block sets crash
-/// CUDA when neighbor indices are missing from inverse_index_map.
-inline core::Tensor ExpandBlockKeysForMeshExtract(
-        const core::Tensor& block_keys) {
-    if (block_keys.NumElements() == 0) {
+/// Marching-cubes mesh extract needs neighbor blocks in inverse_index_map.
+inline core::Tensor ExpandBlockKeysByBlockRadius(const core::Tensor& block_keys,
+                                                 int radius_blocks) {
+    if (block_keys.NumElements() == 0 || radius_blocks <= 0) {
         return block_keys;
     }
     core::Tensor keys_cpu =
             block_keys.To(core::Device("CPU:0")).Contiguous();
     const int32_t* data = keys_cpu.GetDataPtr<int32_t>();
     const int64_t n = keys_cpu.GetLength();
+    const int32_t r = static_cast<int32_t>(radius_blocks);
+    const size_t est = static_cast<size_t>(n) *
+                       static_cast<size_t>((2 * r + 1) * (2 * r + 1) * (2 * r + 1));
     std::unordered_set<BlockKey3, BlockKey3Hash> expanded;
-    expanded.reserve(static_cast<size_t>(n) * 27);
+    expanded.reserve(est);
     for (int64_t i = 0; i < n; ++i) {
         const int32_t x = data[i * 3 + 0];
         const int32_t y = data[i * 3 + 1];
         const int32_t z = data[i * 3 + 2];
-        for (int32_t dx = -1; dx <= 1; ++dx) {
-            for (int32_t dy = -1; dy <= 1; ++dy) {
-                for (int32_t dz = -1; dz <= 1; ++dz) {
+        for (int32_t dx = -r; dx <= r; ++dx) {
+            for (int32_t dy = -r; dy <= r; ++dy) {
+                for (int32_t dz = -r; dz <= r; ++dz) {
                     expanded.insert({x + dx, y + dy, z + dz});
                 }
             }
@@ -361,6 +365,126 @@ inline core::Tensor ExpandBlockKeysForMeshExtract(
     }
     return core::Tensor(flat, {static_cast<int64_t>(expanded.size()), 3},
                         core::Int32, core::Device("CPU:0"));
+}
+
+inline core::Tensor ExpandBlockKeysForMeshExtract(
+        const core::Tensor& block_keys) {
+    return ExpandBlockKeysByBlockRadius(block_keys, 1);
+}
+
+inline core::Tensor MergeBlockKeysTensor(const core::Tensor& keys_a,
+                                         const core::Tensor& keys_b) {
+    if (keys_a.NumElements() == 0) {
+        return keys_b;
+    }
+    if (keys_b.NumElements() == 0) {
+        return keys_a;
+    }
+    core::Tensor a_cpu = keys_a.To(core::Device("CPU:0")).Contiguous();
+    core::Tensor b_cpu = keys_b.To(core::Device("CPU:0")).Contiguous();
+    std::unordered_set<BlockKey3, BlockKey3Hash> merged;
+    const int32_t* a_data = a_cpu.GetDataPtr<int32_t>();
+    const int64_t a_n = a_cpu.GetLength();
+    merged.reserve(static_cast<size_t>(a_n + b_cpu.GetLength()));
+    for (int64_t i = 0; i < a_n; ++i) {
+        merged.insert({a_data[i * 3 + 0], a_data[i * 3 + 1], a_data[i * 3 + 2]});
+    }
+    const int32_t* b_data = b_cpu.GetDataPtr<int32_t>();
+    const int64_t b_n = b_cpu.GetLength();
+    for (int64_t i = 0; i < b_n; ++i) {
+        merged.insert({b_data[i * 3 + 0], b_data[i * 3 + 1], b_data[i * 3 + 2]});
+    }
+    std::vector<int32_t> flat;
+    flat.reserve(merged.size() * 3);
+    for (const auto& key : merged) {
+        flat.push_back(key.x);
+        flat.push_back(key.y);
+        flat.push_back(key.z);
+    }
+    return core::Tensor(flat, {static_cast<int64_t>(merged.size()), 3},
+                        core::Int32, core::Device("CPU:0"));
+}
+
+inline int ComputeRegionSeamBlockRadius(const SegmentationConfig& config) {
+    if (config.region_seam_block_radius > 0) {
+        return config.region_seam_block_radius;
+    }
+    return std::max(2, static_cast<int>(std::ceil(
+                               static_cast<double>(config.trunc_multiplier) / 4.0)));
+}
+
+inline core::Tensor CollectNeighborBlockKeys(const core::Tensor& source_keys,
+                                             const core::Tensor& reference_keys,
+                                             int radius_blocks) {
+    if (source_keys.NumElements() == 0 || reference_keys.NumElements() == 0 ||
+        radius_blocks <= 0) {
+        return core::Tensor({}, core::Int32, core::Device("CPU:0"));
+    }
+    core::Tensor ref_cpu =
+            reference_keys.To(core::Device("CPU:0")).Contiguous();
+    const int32_t* ref_data = ref_cpu.GetDataPtr<int32_t>();
+    const int64_t ref_n = ref_cpu.GetLength();
+    const int32_t r = static_cast<int32_t>(radius_blocks);
+
+    core::Tensor src_cpu = source_keys.To(core::Device("CPU:0")).Contiguous();
+    const int32_t* src_data = src_cpu.GetDataPtr<int32_t>();
+    const int64_t src_n = src_cpu.GetLength();
+    std::vector<int32_t> flat;
+    flat.reserve(static_cast<size_t>(src_n) * 3);
+    for (int64_t i = 0; i < src_n; ++i) {
+        const int32_t sx = src_data[i * 3 + 0];
+        const int32_t sy = src_data[i * 3 + 1];
+        const int32_t sz = src_data[i * 3 + 2];
+        bool near_reference = false;
+        for (int64_t j = 0; j < ref_n; ++j) {
+            const int32_t dx = std::abs(sx - ref_data[j * 3 + 0]);
+            const int32_t dy = std::abs(sy - ref_data[j * 3 + 1]);
+            const int32_t dz = std::abs(sz - ref_data[j * 3 + 2]);
+            if (dx <= r && dy <= r && dz <= r) {
+                near_reference = true;
+                break;
+            }
+        }
+        if (near_reference) {
+            flat.push_back(sx);
+            flat.push_back(sy);
+            flat.push_back(sz);
+        }
+    }
+    if (flat.empty()) {
+        return core::Tensor({}, core::Int32, core::Device("CPU:0"));
+    }
+    return core::Tensor(flat, {static_cast<int64_t>(flat.size() / 3), 3},
+                        core::Int32, core::Device("CPU:0"));
+}
+
+inline geometry::AxisAlignedBoundingBox BlockKeysWorldAABB(
+        const core::Tensor& block_keys,
+        float voxel_size,
+        int block_resolution) {
+    if (block_keys.NumElements() == 0) {
+        return geometry::AxisAlignedBoundingBox();
+    }
+    const double block_extent =
+            static_cast<double>(voxel_size) * block_resolution;
+    core::Tensor keys_cpu =
+            block_keys.To(core::Device("CPU:0")).Contiguous();
+    const int32_t* data = keys_cpu.GetDataPtr<int32_t>();
+    const int64_t n = keys_cpu.GetLength();
+    Eigen::Vector3d min_b =
+            Eigen::Vector3d::Constant(std::numeric_limits<double>::max());
+    Eigen::Vector3d max_b =
+            Eigen::Vector3d::Constant(std::numeric_limits<double>::lowest());
+    for (int64_t i = 0; i < n; ++i) {
+        const Eigen::Vector3d block_min(data[i * 3 + 0] * block_extent,
+                                        data[i * 3 + 1] * block_extent,
+                                        data[i * 3 + 2] * block_extent);
+        const Eigen::Vector3d block_max =
+                block_min + Eigen::Vector3d::Constant(block_extent);
+        min_b = min_b.cwiseMin(block_min);
+        max_b = max_b.cwiseMax(block_max);
+    }
+    return geometry::AxisAlignedBoundingBox(min_b, max_b);
 }
 
 inline core::Tensor CollectBlockKeys(
@@ -551,17 +675,41 @@ inline void ApplyFreezeAndExtractMesh(
             static_cast<double>(config.voxel_size) * config.block_resolution *
                     config.max_triangle_edge_multiplier,
             std::max(0.05, cluster_bounds.GetMaxExtent() * 0.35));
+    const double block_extent =
+            static_cast<double>(config.voxel_size) * config.block_resolution;
     const double bounds_margin =
-            static_cast<double>(config.voxel_size) * config.trunc_multiplier;
+            std::max(static_cast<double>(config.voxel_size) *
+                             config.trunc_multiplier,
+                     block_extent);
 
-    candidate.block_keys = ExpandBlockKeysForMeshExtract(
-            CollectBlockKeys(model.voxel_grid_, cluster, config.trunc_multiplier));
+    const int seam_radius = ComputeRegionSeamBlockRadius(config);
+    core::Tensor raw_block_keys =
+            CollectBlockKeys(model.voxel_grid_, cluster, config.trunc_multiplier);
+    core::Tensor region_block_keys =
+            ExpandBlockKeysByBlockRadius(raw_block_keys, seam_radius);
+    const core::Tensor existing_frozen = model.GetFrozenBlockKeys();
+    if (existing_frozen.NumElements() > 0) {
+        region_block_keys = MergeBlockKeysTensor(
+                region_block_keys,
+                CollectNeighborBlockKeys(existing_frozen, raw_block_keys,
+                                         seam_radius));
+    }
+    candidate.block_keys = region_block_keys;
     const core::Device mesh_device =
             model.voxel_grid_.GetHashMap().GetDevice();
     if (candidate.block_keys.NumElements() == 0) {
         candidate.bounds = cluster_bounds;
         return;
     }
+
+    geometry::AxisAlignedBoundingBox sanitize_bounds = cluster_bounds;
+    const geometry::AxisAlignedBoundingBox block_bounds =
+            BlockKeysWorldAABB(region_block_keys, config.voxel_size,
+                               config.block_resolution);
+    sanitize_bounds.min_bound_ =
+            sanitize_bounds.min_bound_.cwiseMin(block_bounds.min_bound_);
+    sanitize_bounds.max_bound_ =
+            sanitize_bounds.max_bound_.cwiseMax(block_bounds.max_bound_);
 
     model.FreezeBlocks(candidate.block_keys);
     if (config.tsdf_mesh_only || candidate.type == ObjectType::kGeneric) {
@@ -575,7 +723,7 @@ inline void ApplyFreezeAndExtractMesh(
         if (candidate.mesh.HasVertexPositions() &&
             candidate.mesh.HasTriangleIndices()) {
             geometry::TriangleMesh legacy = candidate.mesh.ToLegacy();
-            SanitizeRegionTriangleMesh(legacy, cluster_bounds, max_edge_length,
+            SanitizeRegionTriangleMesh(legacy, sanitize_bounds, max_edge_length,
                                        bounds_margin,
                                        config.max_triangle_aspect_ratio);
             if (legacy.triangles_.empty()) {
@@ -592,7 +740,7 @@ inline void ApplyFreezeAndExtractMesh(
         if (candidate.mesh.HasVertexPositions() &&
             candidate.mesh.HasTriangleIndices()) {
             geometry::TriangleMesh legacy = candidate.mesh.ToLegacy();
-            SanitizeRegionTriangleMesh(legacy, cluster_bounds, max_edge_length,
+            SanitizeRegionTriangleMesh(legacy, sanitize_bounds, max_edge_length,
                                        bounds_margin,
                                        config.max_triangle_aspect_ratio);
             if (legacy.triangles_.empty()) {
