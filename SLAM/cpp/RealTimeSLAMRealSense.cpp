@@ -103,8 +103,9 @@ SlamParams GetProfile(const std::string& profile) {
         p.regions.interval = 60;
         return p;
     }
+    // Default medium: balance quality and VRAM for indoor region mesh.
     p.regions.min_points = 3000;
-    p.regions.stability_frames = 4;
+    p.regions.stability_frames = 5;
     p.regions.interval = 45;
     return p;
 }
@@ -140,6 +141,21 @@ void PrintHelp() {
     utility::LogInfo("    [--region_stability N]  Stable frames before freeze (default: 5).");
     utility::LogInfo("    [--region_interval N]   Region check every N frames (default: 60).");
     utility::LogInfo("    [--region_dir PATH]     Output directory (default: regions).");
+    utility::LogInfo("    [--region_min_readiness F] Min mesh readiness 0-1 (default: 0.80).");
+    utility::LogInfo("    [--region_max_holey_defer N] Max hole-defer cycles (default: 40).");
+    utility::LogInfo("    [--region_no_holey_defer] Disable holey-region mesh deferral.");
+    utility::LogInfo("    [--region_max_void_ratio R] Max local void ratio (default: 0.08).");
+    utility::LogInfo("    [--region_max_void_blob N] Max connected void cells (default: 32).");
+    utility::LogInfo("    [--region_max_boundary_void R] Max boundary void ratio (default: 0.10).");
+    utility::LogInfo("    [--region_extract_weight W] Region TSDF extract weight (default: 3.0).");
+    utility::LogInfo("    [--region_depth_min M] Camera-distance band min meters (default: 0.3).");
+    utility::LogInfo("    [--region_depth_max M] Camera-distance band max (default: min(2.5, depth_max)).");
+    utility::LogInfo("    [--region_max_extent M] Max cluster extent / split tile size m (default: 1.2).");
+    utility::LogInfo("    [--region_min_motion_m M] Net translation (m) vs anchor (default: 0.05).");
+    utility::LogInfo("    [--region_min_motion_deg D] Net rotation (deg) vs anchor (default: 8).");
+    utility::LogInfo("    [--region_min_hash_delta N] Min hash-block growth with motion (default: 2).");
+    utility::LogInfo("    [--region_motion_warmup N] Skip region mesh for first N frames (default: 45).");
+    utility::LogInfo("    [--region_allow_stationary_mesh] Allow mesh commit while camera is still.");
     utility::LogInfo("    [--global_reloc 0|1]    Enable keyframe global relocalization (default: 1).");
     utility::LogInfo("    [--keyframe_interval N] Min frames between keyframes (default: 30).");
     utility::LogInfo("    [--keyframe_max N]      Max stored keyframes (default: 48).");
@@ -156,6 +172,7 @@ void PrintHelp() {
     utility::LogInfo("");
     utility::LogInfo("Indoor room scan tips:");
     utility::LogInfo("    Walk slowly (~0.3 m/s), keep 30%% overlap between views.");
+    utility::LogInfo("    Prefer --profile medium for region mesh quality (holes).");
     utility::LogInfo("    Use --profile high --depth_max 8 for large rooms.");
     utility::LogInfo("    scene_mesh.ply is the watertight mesh; scene.ply is points.");
     utility::LogInfo("");
@@ -218,16 +235,22 @@ bool IsHashNearFull(int64_t hash_size, int64_t hash_capacity) {
 }
 
 static constexpr int kMaxExtractPoints = 12000000;
-static constexpr int kPointsPerHashBlock = 200;
-static constexpr int kMaxRegionSegmentationPoints = 200000;
+// Surface crossings can greatly exceed sparse occupancy; under-estimating the
+// one-pass CUDA extract buffer can abort the process (0xc0000409).
+static constexpr int kPointsPerHashBlock = 1600;
+static constexpr int kMaxRegionSegmentationPoints = 60000;
 static constexpr double kDbscanEpsMultiplier = 4.0;
 
 int GetExtractPointBudget(int estimated_points, int64_t hash_size) {
     const int64_t hash_based = std::min(
             hash_size * static_cast<int64_t>(kPointsPerHashBlock),
             static_cast<int64_t>(kMaxExtractPoints));
+    // Extra headroom: one-pass extract must not be smaller than the true count.
+    const int64_t with_margin = std::min(
+            hash_based + hash_based / 2,
+            static_cast<int64_t>(kMaxExtractPoints));
     return static_cast<int>(std::max(static_cast<int64_t>(estimated_points),
-                                     hash_based));
+                                     with_margin));
 }
 
 void ClampPointColors(geometry::PointCloud& pcd) {
@@ -382,7 +405,7 @@ object_mesh::SegmentationConfig BuildRegionSegmentationConfig(
     return object_mesh::BuildLiveRegionSegmentationConfig(
             params.voxel_size, params.trunc_multiplier, extract_weight,
             params.regions.min_points, params.regions.stability_frames,
-            kDbscanEpsMultiplier);
+            params.regions, kDbscanEpsMultiplier);
 }
 
 struct SlamRuntime {
@@ -393,10 +416,23 @@ struct SlamRuntime {
     std::mutex region_mutex;
     std::condition_variable region_cv;
     std::atomic<bool> region_requested{false};
+    std::atomic<bool> region_worker_busy{false};
     std::atomic<bool> region_stop{false};
     t::geometry::PointCloud pending_region_pcd;
     float pending_extract_weight = 3.0f;
     int pending_frame_id = 0;
+    t::geometry::PointCloud last_region_surface_pcd;
+    float last_region_extract_weight = 3.0f;
+    int last_region_frame_id = 0;
+    bool have_last_region_surface = false;
+
+    double motion_window_translation_m = 0.0;
+    double motion_window_rotation_deg = 0.0;
+    bool camera_moved_for_regions = false;
+    core::Tensor motion_anchor_T;
+    int64_t motion_anchor_hash = 0;
+    bool have_motion_anchor = false;
+    std::vector<object_mesh::FrozenObjectCandidate> committed_region_meshes;
 
     object_mesh::ObjectFreezeTracker freeze_tracker{
             object_mesh::SegmentationConfig{}};
@@ -436,29 +472,51 @@ core::Tensor ApplyPoseDrift(const core::Tensor& T,
 void RegionWorker(SlamRuntime& runtime,
                   const SlamParams& params,
                   DisplayState& state) {
-    while (!runtime.region_stop.load() && !state.request_stop.load()) {
+    bool exit_flush_done = false;
+    while (true) {
         t::geometry::PointCloud surface_pcd;
         float extract_weight = 3.0f;
         int frame_id = 0;
+        bool process_request = false;
+        bool session_stopping = false;
         {
             std::unique_lock<std::mutex> lock(runtime.region_mutex);
             runtime.region_cv.wait(lock, [&]() {
                 return runtime.region_requested.load() ||
                        runtime.region_stop.load() || state.request_stop.load();
             });
-            if (runtime.region_stop.load() || state.request_stop.load()) {
+            session_stopping =
+                    runtime.region_stop.load() || state.request_stop.load();
+
+            if (runtime.region_requested.load()) {
+                runtime.region_requested.store(false);
+                surface_pcd = std::move(runtime.pending_region_pcd);
+                extract_weight = runtime.pending_extract_weight;
+                frame_id = runtime.pending_frame_id;
+                process_request = true;
+            } else if (session_stopping && !exit_flush_done &&
+                       params.regions.flush_holey_on_exit &&
+                       runtime.have_last_region_surface) {
+                surface_pcd = runtime.last_region_surface_pcd;
+                extract_weight = runtime.last_region_extract_weight;
+                frame_id = runtime.last_region_frame_id;
+                process_request = true;
+                exit_flush_done = true;
+            } else {
                 break;
             }
-            runtime.region_requested.store(false);
-            surface_pcd = std::move(runtime.pending_region_pcd);
-            extract_weight = runtime.pending_extract_weight;
-            frame_id = runtime.pending_frame_id;
         }
 
-        if (!runtime.model_ready.load() || !runtime.model ||
+        if (!process_request || !runtime.model_ready.load() || !runtime.model ||
             surface_pcd.IsEmpty()) {
+            if (session_stopping) {
+                break;
+            }
             continue;
         }
+
+        runtime.region_worker_busy.store(true);
+        const auto region_t0 = std::chrono::steady_clock::now();
 
         try {
             surface_pcd = object_mesh::DownsamplePointCloudIfNeeded(
@@ -466,6 +524,9 @@ void RegionWorker(SlamRuntime& runtime,
                     params.voxel_size);
             object_mesh::SegmentationConfig config =
                     BuildRegionSegmentationConfig(params, extract_weight);
+            config.camera_moved_since_last_check =
+                    runtime.camera_moved_for_regions ||
+                    !params.regions.require_camera_motion;
             runtime.freeze_tracker.SetConfig(config);
 
             std::vector<object_mesh::FrozenObjectCandidate> pending;
@@ -476,80 +537,102 @@ void RegionWorker(SlamRuntime& runtime,
             if (pending.empty()) {
                 utility::LogInfo(
                         "Region check frame {}: surface segmented, waiting for "
-                        "stable cluster (tracked {}, frozen {}).",
+                        "stable cluster (tracked {}, pending {}, holey {}, "
+                        "frozen {}).",
                         frame_id, runtime.freeze_tracker.TrackedCount(),
+                        runtime.freeze_tracker.PendingCount(),
+                        runtime.freeze_tracker.PendingHoleyCount(),
                         runtime.freeze_tracker.FrozenCount());
             }
 
-            std::vector<object_mesh::FrozenObjectCandidate> frozen_now;
-            for (auto& candidate : pending) {
-                const t::geometry::PointCloud region_cluster =
-                        candidate.source_cluster;
-                try {
-                    {
-                        std::lock_guard<std::mutex> model_lock(
-                                runtime.model_mutex);
-                        object_mesh::ApplyFreezeAndExtractMesh(
-                                candidate, *runtime.model, config);
-                    }
-                    if (candidate.mesh.HasVertexPositions() ||
-                        region_cluster.HasPointPositions()) {
-                        candidate.source_cluster = region_cluster;
-                        frozen_now.push_back(std::move(candidate));
-                    }
-                } catch (const std::exception& e) {
-                    utility::LogWarning(
-                            "Region freeze skipped for candidate {} at "
-                            "frame {}: {}",
-                            candidate.id, frame_id, e.what());
-                }
-            }
-
-            if (frozen_now.empty()) {
-                utility::LogInfo(
-                        "Region check frame {}: {} candidate(s) tracked, none "
-                        "ready to freeze yet.",
-                        frame_id, static_cast<int>(pending.size()));
-                continue;
-            }
-
-            int total_regions = 0;
+            const bool session_stopping =
+                    runtime.region_stop.load() || state.request_stop.load();
+            object_mesh::RegionProcessResult processed;
             {
-                std::lock_guard<std::mutex> lock(runtime.records_mutex);
-                for (auto& candidate : frozen_now) {
-                    object_mesh::RegionRecord record;
-                    if (!object_mesh::SaveFrozenRegion(params.regions, candidate,
-                                                       frame_id, record)) {
-                        continue;
-                    }
-                    runtime.region_records.push_back(record);
+                std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
+                processed = object_mesh::ProcessPendingRegionCandidates(
+                        pending, *runtime.model, runtime.freeze_tracker, config,
+                        session_stopping, runtime.committed_region_meshes);
+            }
 
-                    DisplayState::RegionPair pair;
-                    pair.id = record.id;
-                    if (candidate.mesh.HasTriangleIndices() &&
-                        MeshTriangleCount(candidate.mesh) > 0) {
-                        pair.mesh = std::make_shared<geometry::TriangleMesh>(
-                                candidate.mesh.ToLegacy());
-                        object_mesh::ClampVertexColors(*pair.mesh);
-                    }
-                    if (candidate.source_cluster.HasPointPositions()) {
-                        pair.pcd = std::make_shared<geometry::PointCloud>(
-                                candidate.source_cluster.ToLegacy());
-                        ClampPointColors(*pair.pcd);
-                    }
+            for (auto& seam : processed.seam_updates) {
+                DisplayState::RegionPair pair;
+                pair.id = seam.id;
+                if (object_mesh::IsValidRegionMesh(seam.mesh)) {
+                    pair.mesh = std::make_shared<geometry::TriangleMesh>(
+                            seam.mesh.ToLegacy());
+                    object_mesh::ClampVertexColors(*pair.mesh);
                     state.PushRegionPair(std::move(pair));
                 }
-                object_mesh::WriteRegionsJson(params.regions.output_dir,
-                                 runtime.region_records);
-                total_regions = static_cast<int>(runtime.region_records.size());
+                for (auto& stored : runtime.committed_region_meshes) {
+                    if (stored.id == seam.id) {
+                        stored.mesh = std::move(seam.mesh);
+                        break;
+                    }
+                }
             }
-            state.SetRegionCount(total_regions);
-            utility::LogInfo("Frozen {} region(s). Total regions: {}.",
-                             frozen_now.size(), total_regions);
+
+            if (processed.committed.empty()) {
+                utility::LogInfo(
+                        "Region check frame {}: {} candidate(s) tracked, none "
+                        "ready to freeze yet (deferred holey {} void {} "
+                        "stationary {}).",
+                        frame_id, static_cast<int>(pending.size()),
+                        processed.deferred_holey, processed.deferred_void,
+                        processed.deferred_stationary);
+            } else {
+                int total_regions = 0;
+                {
+                    std::lock_guard<std::mutex> lock(runtime.records_mutex);
+                    for (auto& candidate : processed.committed) {
+                        object_mesh::RegionRecord record;
+                        if (!object_mesh::SaveFrozenRegion(params.regions, candidate,
+                                                           frame_id, record)) {
+                            continue;
+                        }
+                        runtime.region_records.push_back(record);
+
+                        DisplayState::RegionPair pair;
+                        pair.id = record.id;
+                        if (object_mesh::IsValidRegionMesh(candidate.mesh)) {
+                            pair.mesh = std::make_shared<geometry::TriangleMesh>(
+                                    candidate.mesh.ToLegacy());
+                            object_mesh::ClampVertexColors(*pair.mesh);
+                        }
+                        object_mesh::FrozenObjectCandidate stored = candidate;
+                        runtime.committed_region_meshes.push_back(
+                                std::move(stored));
+                        state.PushRegionPair(std::move(pair));
+                    }
+                    object_mesh::WriteRegionsJson(params.regions.output_dir,
+                                     runtime.region_records);
+                    total_regions = static_cast<int>(runtime.region_records.size());
+                }
+                state.SetRegionCount(total_regions);
+                utility::LogInfo("Frozen {} region(s). Total regions: {}.",
+                                 processed.committed.size(), total_regions);
+            }
         } catch (const std::exception& e) {
             utility::LogWarning("Region worker failed at frame {}: {}",
                                 frame_id, e.what());
         }
+        const auto region_ms = std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - region_t0)
+                                       .count();
+        if (region_ms > 500) {
+            utility::LogInfo("Region worker frame {} took {} ms.", frame_id,
+                             region_ms);
+        }
+        runtime.region_worker_busy.store(false);
+        if (session_stopping && exit_flush_done) {
+            break;
+        }
+    }
+    if (runtime.freeze_tracker.PendingHoleyCount() > 0) {
+        utility::LogWarning(
+                "Region worker exiting with {} pending holey region(s).",
+                runtime.freeze_tracker.PendingHoleyCount());
     }
 }
 
@@ -663,10 +746,14 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             continue;
         }
 
+        try {
         t::geometry::RGBDImage rgbd = (frame_id == 0) ? first : capture_frame();
         if (rgbd.IsEmpty()) {
             if (frame_id == 0) {
-                utility::LogError("Empty RGB-D frame at startup.");
+                // LogError throws/aborts the worker thread (0xc0000409).
+                utility::LogWarning(
+                        "Empty RGB-D frame at startup; stopping SLAM loop.");
+                break;
             }
             ++empty_capture_retries;
             if (empty_capture_retries >= kMaxEmptyCaptureRetries) {
@@ -738,10 +825,20 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             const std::vector<int> candidate_ids =
                     keyframe_db.SelectCandidates(query_position, live_histogram,
                                                  runtime.reloc_config);
-            last_reloc_attempt = relocalization::Relocalize(
-                    rgbd, intrinsic, keyframe_db, candidate_ids,
-                    last_stable_T_frame_to_model, params.depth_scale,
-                    params.depth_max, runtime.reloc_config, device);
+            try {
+                last_reloc_attempt = relocalization::Relocalize(
+                        rgbd, intrinsic, keyframe_db, candidate_ids,
+                        last_stable_T_frame_to_model, params.depth_scale,
+                        params.depth_max, runtime.reloc_config, device);
+            } catch (const std::exception& e) {
+                last_reloc_attempt = {};
+                last_reloc_attempt.accepted = false;
+                last_reloc_attempt.reject_reason =
+                        std::string("exception: ") + e.what();
+                utility::LogWarning(
+                        "Global relocalization threw at frame {}: {}",
+                        frame_id, e.what());
+            }
             if (last_reloc_attempt.accepted) {
                 T_frame_to_model = last_reloc_attempt.T_live_to_world.Contiguous();
                 global_reloc_recovering = true;
@@ -906,6 +1003,8 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                                                  track_rotation);
                     }
                 }
+                // Motion gate uses net pose vs anchor + hash growth (not
+                // summed frame-to-frame jitter).
 
                 if (tracking_tier == TrackingTier::kStrong) {
                     core::Tensor candidate_T_frame_to_model =
@@ -1031,15 +1130,22 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
 
         {
             std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
-            model.UpdateFramePose(frame_id, T_frame_to_model);
-            if (integrate && !hash_near_full) {
-                model.Integrate(input_frame, params.depth_scale, params.depth_max,
-                                params.trunc_multiplier);
-                ++integrated_frames;
+            try {
+                model.UpdateFramePose(frame_id, T_frame_to_model);
+                if (integrate && !hash_near_full) {
+                    model.Integrate(input_frame, params.depth_scale,
+                                    params.depth_max, params.trunc_multiplier);
+                    ++integrated_frames;
+                }
+                model.SynthesizeModelFrame(
+                        raycast_frame, params.depth_scale, 0.1f,
+                        params.depth_max, params.trunc_multiplier, false);
+            } catch (const std::exception& e) {
+                integrate = false;
+                utility::LogWarning(
+                        "Integrate/raycast failed at frame {}: {}", frame_id,
+                        e.what());
             }
-            model.SynthesizeModelFrame(raycast_frame, params.depth_scale, 0.1f,
-                                       params.depth_max, params.trunc_multiplier,
-                                       false);
         }
 
         if (integrate) {
@@ -1080,8 +1186,66 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         }
 
         if (params.regions.enabled &&
-            ShouldCheckRegions(frame_id, params.regions.interval)) {
-            const float region_weight = ExtractWeightThreshold(frame_id);
+            ShouldCheckRegions(frame_id, params.regions.interval) &&
+            !runtime.region_worker_busy.load() &&
+            consecutive_tracking_failures <= kLostTrackingThreshold) {
+            if (!runtime.have_motion_anchor) {
+                runtime.motion_anchor_T = T_frame_to_model.Contiguous();
+                runtime.motion_anchor_hash = hash_size_before;
+                runtime.have_motion_anchor = true;
+            }
+
+            object_mesh::CameraMotionSample motion_sample;
+            object_mesh::RelativePoseMetrics(
+                    runtime.motion_anchor_T, T_frame_to_model,
+                    motion_sample.net_translation_m,
+                    motion_sample.net_rotation_deg);
+            motion_sample.hash_delta =
+                    hash_size_before - runtime.motion_anchor_hash;
+            if (motion_sample.hash_delta < 0) {
+                motion_sample.hash_delta = 0;
+            }
+            motion_sample.frame_id = frame_id;
+
+            object_mesh::SegmentationConfig motion_cfg;
+            motion_cfg.require_camera_motion =
+                    params.regions.require_camera_motion;
+            motion_cfg.min_motion_translation_m =
+                    params.regions.min_motion_translation_m;
+            motion_cfg.min_motion_rotation_deg =
+                    params.regions.min_motion_rotation_deg;
+            motion_cfg.min_hash_delta_blocks =
+                    params.regions.min_hash_delta_blocks;
+            motion_cfg.region_motion_warmup_frames =
+                    params.regions.region_motion_warmup_frames;
+
+            const bool camera_moved =
+                    object_mesh::CameraMovedEnough(motion_cfg, motion_sample);
+            runtime.camera_moved_for_regions = camera_moved;
+            runtime.motion_window_translation_m =
+                    motion_sample.net_translation_m;
+            runtime.motion_window_rotation_deg = motion_sample.net_rotation_deg;
+
+            if (!camera_moved) {
+                if (frame_id < params.regions.region_motion_warmup_frames) {
+                    utility::LogInfo(
+                            "Region check skipped: motion warmup "
+                            "(frame {}/{}, net t={:.4f} m, r={:.2f} deg, "
+                            "dhash={}).",
+                            frame_id, params.regions.region_motion_warmup_frames,
+                            motion_sample.net_translation_m,
+                            motion_sample.net_rotation_deg,
+                            motion_sample.hash_delta);
+                } else {
+                    utility::LogInfo(
+                            "Region check skipped: camera nearly stationary "
+                            "(net t={:.4f} m, r={:.2f} deg, dhash={}).",
+                            motion_sample.net_translation_m,
+                            motion_sample.net_rotation_deg,
+                            motion_sample.hash_delta);
+                }
+            } else {
+            const float region_weight = params.regions.extract_weight;
             try {
                 t::geometry::PointCloud region_pcd;
                 {
@@ -1092,25 +1256,58 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                             region_weight, -1);
                     region_pcd = region_pcd.To(core::Device("CPU:0"));
                 }
-                if (region_pcd.HasPointPositions()) {
-                    const int64_t region_points =
-                            region_pcd.GetPointPositions().GetLength();
+                const int64_t before_filter =
+                        region_pcd.HasPointPositions()
+                                ? region_pcd.GetPointPositions().GetLength()
+                                : 0;
+                if (before_filter > 0) {
+                    region_pcd = object_mesh::FilterPointCloudByCameraDistance(
+                            region_pcd, T_frame_to_model,
+                            params.regions.depth_min_m,
+                            params.regions.depth_max_m);
+                }
+                const int64_t after_filter =
+                        region_pcd.HasPointPositions()
+                                ? region_pcd.GetPointPositions().GetLength()
+                                : 0;
+                utility::LogInfo(
+                        "Region surface filtered: {} -> {} points "
+                        "(weight={}, depth=[{:.2f},{:.2f}] m).",
+                        before_filter, after_filter, region_weight,
+                        params.regions.depth_min_m,
+                        params.regions.depth_max_m);
+                if (after_filter > 0) {
                     {
                         std::lock_guard<std::mutex> lock(runtime.region_mutex);
                         runtime.pending_region_pcd = std::move(region_pcd);
                         runtime.pending_extract_weight = region_weight;
                         runtime.pending_frame_id = frame_id;
+                        runtime.last_region_surface_pcd =
+                                runtime.pending_region_pcd;
+                        runtime.last_region_extract_weight = region_weight;
+                        runtime.last_region_frame_id = frame_id;
+                        runtime.have_last_region_surface = true;
                         runtime.region_requested.store(true);
                     }
                     runtime.region_cv.notify_one();
                     utility::LogInfo(
-                            "Region segmentation queued at frame {} ({} points).",
-                            frame_id, region_points);
+                            "Region segmentation queued at frame {} ({} points, "
+                            "net t={:.4f} m, r={:.2f} deg, dhash={}).",
+                            frame_id, after_filter,
+                            motion_sample.net_translation_m,
+                            motion_sample.net_rotation_deg,
+                            motion_sample.hash_delta);
+                    runtime.motion_anchor_T = T_frame_to_model.Contiguous();
+                    runtime.motion_anchor_hash = hash_size_before;
+                    runtime.have_motion_anchor = true;
+                    runtime.motion_window_translation_m = 0.0;
+                    runtime.motion_window_rotation_deg = 0.0;
                 }
             } catch (const std::exception& e) {
                 utility::LogWarning("Region extract skipped at frame {}: {}",
                                     frame_id, e.what());
             }
+            }  // camera_moved
         }
 
         if (ShouldRefreshDisplay(frame_id, params.update_interval)) {
@@ -1122,11 +1319,17 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 t::geometry::PointCloud pcd_t;
                 {
                     std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
+                    // Always 2-pass (-1) with regions: frozen filters + one-pass
+                    // under-estimate can abort via CUDA extract fail-fast.
+                    const int extract_arg =
+                            (params.regions.enabled || hash_size_before > 2000)
+                                    ? -1
+                                    : extract_budget;
                     if (params.regions.enabled) {
                         pcd_t = model.ExtractPointCloudExcludingFrozen(
-                                weight, extract_budget);
+                                weight, extract_arg);
                     } else {
-                        pcd_t = model.ExtractPointCloud(weight, extract_budget);
+                        pcd_t = model.ExtractPointCloud(weight, extract_arg);
                     }
                 }
                 auto pcd =
@@ -1254,6 +1457,17 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
 
         prev_rgbd = rgbd;
         ++frame_id;
+        } catch (const std::exception& e) {
+            utility::LogWarning("SLAM worker exception at frame {}: {}",
+                                frame_id, e.what());
+            ++frame_id;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } catch (...) {
+            utility::LogWarning("SLAM worker unknown exception at frame {}.",
+                                frame_id);
+            ++frame_id;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
     }
 
     runtime.model_ready.store(false);
@@ -1293,7 +1507,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         utility::LogInfo("Saved scene_mesh.ply ({} vertices).",
                          final_mesh->vertices_.size());
     } catch (const std::exception& e) {
-        utility::LogError("Failed to extract/save scene: {}", e.what());
+        utility::LogWarning("Failed to extract/save scene: {}", e.what());
     }
 
     if (params.regions.enabled) {
@@ -1434,6 +1648,90 @@ int main(int argc, char* argv[]) {
                 utility::GetProgramOptionAsString(argc, argv, "--region_dir",
                                                   params.regions.output_dir);
     }
+    if (utility::ProgramOptionExists(argc, argv, "--region_min_readiness")) {
+        params.regions.min_readiness = static_cast<float>(
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_min_readiness",
+                        params.regions.min_readiness));
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_max_holey_defer")) {
+        params.regions.max_holey_defer = utility::GetProgramOptionAsInt(
+                argc, argv, "--region_max_holey_defer",
+                params.regions.max_holey_defer);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_no_holey_defer")) {
+        params.regions.defer_holey = false;
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_max_void_ratio")) {
+        params.regions.max_void_ratio = utility::GetProgramOptionAsDouble(
+                argc, argv, "--region_max_void_ratio",
+                params.regions.max_void_ratio);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_max_void_blob")) {
+        params.regions.max_void_blob_cells = utility::GetProgramOptionAsInt(
+                argc, argv, "--region_max_void_blob",
+                params.regions.max_void_blob_cells);
+    }
+    if (utility::ProgramOptionExists(argc, argv,
+                                     "--region_max_boundary_void")) {
+        params.regions.max_boundary_void_ratio =
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_max_boundary_void",
+                        params.regions.max_boundary_void_ratio);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_extract_weight")) {
+        params.regions.extract_weight = static_cast<float>(
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_extract_weight",
+                        params.regions.extract_weight));
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_depth_min")) {
+        params.regions.depth_min_m = utility::GetProgramOptionAsDouble(
+                argc, argv, "--region_depth_min", params.regions.depth_min_m);
+    }
+    bool region_depth_max_set = false;
+    if (utility::ProgramOptionExists(argc, argv, "--region_depth_max")) {
+        params.regions.depth_max_m = utility::GetProgramOptionAsDouble(
+                argc, argv, "--region_depth_max", params.regions.depth_max_m);
+        region_depth_max_set = true;
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_max_extent")) {
+        params.regions.max_cluster_extent_m =
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_max_extent",
+                        params.regions.max_cluster_extent_m);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_min_motion_m")) {
+        params.regions.min_motion_translation_m =
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_min_motion_m",
+                        params.regions.min_motion_translation_m);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_min_motion_deg")) {
+        params.regions.min_motion_rotation_deg =
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_min_motion_deg",
+                        params.regions.min_motion_rotation_deg);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_min_hash_delta")) {
+        params.regions.min_hash_delta_blocks = utility::GetProgramOptionAsInt(
+                argc, argv, "--region_min_hash_delta",
+                params.regions.min_hash_delta_blocks);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--region_motion_warmup")) {
+        params.regions.region_motion_warmup_frames =
+                utility::GetProgramOptionAsInt(
+                        argc, argv, "--region_motion_warmup",
+                        params.regions.region_motion_warmup_frames);
+    }
+    if (utility::ProgramOptionExists(argc, argv,
+                                     "--region_allow_stationary_mesh")) {
+        params.regions.require_camera_motion = false;
+    }
+    if (!region_depth_max_set) {
+        params.regions.depth_max_m =
+                std::min(2.5, static_cast<double>(params.depth_max));
+    }
 
     SlamRuntime runtime;
     runtime.reloc_config =
@@ -1506,7 +1804,7 @@ int main(int argc, char* argv[]) {
                 runtime.reloc_config.retry_interval_frames);
     }
 
-    tio::RealSenseSensor rs;
+    std::unique_ptr<tio::RealSenseSensor> rs;
     tio::RSBagReader bag_reader;
     std::function<t::geometry::RGBDImage()> capture_frame;
     core::Tensor intrinsic;
@@ -1543,35 +1841,71 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        try {
-            if (!rs.InitSensor(rs_cfg, 0, record_bag)) {
+        // USB / previous-process release can cancel the first StartCapture
+        // (HRESULT 0x800703e3). Recreate the sensor and retry with backoff.
+        constexpr int kMaxAttempts = 5;
+        constexpr auto kRetryDelay = std::chrono::milliseconds(1500);
+        bool capture_started = false;
+        for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+            rs = std::make_unique<tio::RealSenseSensor>();
+            try {
+                if (!rs->InitSensor(rs_cfg, 0, record_bag)) {
+                    utility::LogWarning(
+                            "RealSense InitSensor failed (attempt {}/{}). "
+                            "Check that the camera is connected and not used "
+                            "by another application.",
+                            attempt, kMaxAttempts);
+                } else if (!rs->StartCapture(!record_bag.empty())) {
+                    utility::LogWarning(
+                            "RealSense StartCapture failed (attempt {}/{}).",
+                            attempt, kMaxAttempts);
+                    rs->StopCapture();
+                } else {
+                    capture_started = true;
+                    utility::LogInfo("{}", rs->GetMetadata().ToString());
+                    depth_scale =
+                            static_cast<float>(rs->GetMetadata().depth_scale_);
+                    params.depth_scale = depth_scale;
+                    cam_intrinsic = rs->GetMetadata().intrinsics_;
+                    intrinsic = core::eigen_converter::EigenMatrixToTensor(
+                            rs->GetMetadata().intrinsics_.intrinsic_matrix_);
+                    if (attempt > 1) {
+                        utility::LogInfo(
+                                "RealSense capture started on attempt {}/{}.",
+                                attempt, kMaxAttempts);
+                    }
+                    break;
+                }
+            } catch (const std::exception& e) {
                 utility::LogWarning(
-                        "RealSense sensor initialization failed. Check that "
-                        "the camera is connected and not used by another "
-                        "application.");
-                return 1;
+                        "RealSense startup attempt {}/{} failed: {}", attempt,
+                        kMaxAttempts, e.what());
+                try {
+                    rs->StopCapture();
+                } catch (...) {
+                }
             }
-            utility::LogInfo("{}", rs.GetMetadata().ToString());
-            depth_scale = static_cast<float>(rs.GetMetadata().depth_scale_);
-            params.depth_scale = depth_scale;
-            cam_intrinsic = rs.GetMetadata().intrinsics_;
-            intrinsic = core::eigen_converter::EigenMatrixToTensor(
-                    rs.GetMetadata().intrinsics_.intrinsic_matrix_);
-            if (!rs.StartCapture(!record_bag.empty())) {
-                utility::LogWarning(
-                        "RealSense capture failed to start. Check the camera "
-                        "connection and close other RealSense applications.");
-                return 1;
+            rs.reset();
+            if (attempt < kMaxAttempts) {
+                utility::LogInfo(
+                        "Retrying RealSense open in {} ms (attempt {}/{})...",
+                        kRetryDelay.count(), attempt + 1, kMaxAttempts);
+                std::this_thread::sleep_for(kRetryDelay);
             }
-        } catch (const std::exception& e) {
-            utility::LogWarning("RealSense startup failed: {}", e.what());
+        }
+        if (!capture_started || !rs) {
+            utility::LogWarning(
+                    "RealSense startup failed after {} attempts. Unplug/replug "
+                    "the camera, close RealSense Viewer / other capture apps, "
+                    "then retry.",
+                    kMaxAttempts);
             return 1;
         }
         // RealSense pipelines need a short warmup before the first frame.
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
-        capture_frame = [&rs, align_streams]() -> t::geometry::RGBDImage {
-            return rs.CaptureFrame(true, align_streams);
+        capture_frame = [rs_ptr = rs.get(), align_streams]() -> t::geometry::RGBDImage {
+            return rs_ptr->CaptureFrame(true, align_streams);
         };
     }
 
@@ -1602,7 +1936,9 @@ int main(int argc, char* argv[]) {
             region_thread.join();
         }
         if (!use_bag) {
-            rs.StopCapture();
+            if (rs) {
+                rs->StopCapture();
+            }
         } else {
             bag_reader.Close();
         }
@@ -1630,7 +1966,9 @@ int main(int argc, char* argv[]) {
     }
 
     if (!use_bag) {
-        rs.StopCapture();
+        if (rs) {
+            rs->StopCapture();
+        }
     } else {
         bag_reader.Close();
     }

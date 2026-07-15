@@ -52,6 +52,57 @@ static std::pair<core::Tensor, core::Tensor> BufferRadiusNeighbors(
                           masks_nb.View({27, n, 1}));
 }
 
+/// Marching cubes writes into mesh_structure via inverse_index_map[neighbor].
+/// Filtered include/exclude extracts omit neighbor blocks from that map, so
+/// expand the active buf-index set to cover every neighbor that exists.
+static core::Tensor ExpandActiveBufIndicesWithNeighbors(
+        const core::Tensor &active_buf_indices,
+        const core::Tensor &nb_buf_indices,
+        const core::Tensor &nb_masks) {
+    core::Tensor active_cpu =
+            active_buf_indices.To(core::Device("CPU:0")).Contiguous();
+    core::Tensor nb_cpu =
+            nb_buf_indices.To(core::Device("CPU:0")).Contiguous().Reshape({-1});
+    core::Tensor mask_cpu =
+            nb_masks.To(core::Device("CPU:0")).To(core::UInt8).Contiguous().Reshape(
+                    {-1});
+
+    std::unordered_set<int32_t> unique;
+    const int64_t n_active = active_cpu.GetLength();
+    const int32_t *active_ptr = active_cpu.GetDataPtr<int32_t>();
+    unique.reserve(static_cast<size_t>(n_active) * 2);
+    for (int64_t i = 0; i < n_active; ++i) {
+        unique.insert(active_ptr[i]);
+    }
+
+    const int64_t n_nb = nb_cpu.GetLength();
+    const int32_t *nb_ptr = nb_cpu.GetDataPtr<int32_t>();
+    const uint8_t *mask_ptr = mask_cpu.GetDataPtr<uint8_t>();
+    for (int64_t i = 0; i < n_nb; ++i) {
+        if (mask_ptr[i]) {
+            unique.insert(nb_ptr[i]);
+        }
+    }
+
+    std::vector<int32_t> flat(unique.begin(), unique.end());
+    core::Tensor expanded(flat, {static_cast<int64_t>(flat.size())}, core::Int32,
+                          core::Device("CPU:0"));
+    return expanded.To(active_buf_indices.GetDevice());
+}
+
+static void BuildMeshInverseIndexMap(const core::Tensor &active_buf_indices_i32,
+                                     int64_t hashmap_capacity,
+                                     core::Device device,
+                                     core::Tensor &inverse_index_map) {
+    const int64_t n_active = active_buf_indices_i32.GetLength();
+    inverse_index_map =
+            core::Tensor::Zeros({hashmap_capacity}, core::Int32, device);
+    core::Tensor iota_map =
+            core::Tensor::Arange(0, n_active, 1, core::Int32, device);
+    inverse_index_map.IndexSet({active_buf_indices_i32.To(core::Int64)},
+                               iota_map);
+}
+
 namespace {
 
 struct BlockKey {
@@ -610,14 +661,11 @@ TriangleMesh VoxelBlockGrid::ExtractTriangleMesh(float weight_threshold,
             BufferRadiusNeighbors(block_hashmap_, active_buf_indices_i32);
 
     core::Device device = block_hashmap_->GetDevice();
-    // Map active indices to [0, num_blocks] to be allocated for surface mesh.
-    int64_t num_blocks = block_hashmap_->Size();
-    core::Tensor inverse_index_map({block_hashmap_->GetCapacity()}, core::Int32,
-                                   device);
-    core::Tensor iota_map =
-            core::Tensor::Arange(0, num_blocks, 1, core::Int32, device);
-    inverse_index_map.IndexSet({active_buf_indices_i32.To(core::Int64)},
-                               iota_map);
+    // Map active indices to [0, num_blocks) for mesh_structure allocation.
+    core::Tensor inverse_index_map;
+    BuildMeshInverseIndexMap(active_buf_indices_i32,
+                             block_hashmap_->GetCapacity(), device,
+                             inverse_index_map);
 
     core::Tensor vertices, triangles, vertex_normals, vertex_colors;
 
@@ -656,15 +704,17 @@ TriangleMesh VoxelBlockGrid::ExtractTriangleMeshExcluding(
     core::Tensor active_nb_buf_indices, active_nb_masks;
     std::tie(active_nb_buf_indices, active_nb_masks) =
             BufferRadiusNeighbors(block_hashmap_, active_buf_indices_i32);
+    // Cover neighbor blocks in inverse_index_map (marching-cubes safety).
+    active_buf_indices_i32 = ExpandActiveBufIndicesWithNeighbors(
+            active_buf_indices_i32, active_nb_buf_indices, active_nb_masks);
+    std::tie(active_nb_buf_indices, active_nb_masks) =
+            BufferRadiusNeighbors(block_hashmap_, active_buf_indices_i32);
 
     core::Device device = block_hashmap_->GetDevice();
-    int64_t num_blocks = block_hashmap_->Size();
-    core::Tensor inverse_index_map({block_hashmap_->GetCapacity()}, core::Int32,
-                                   device);
-    core::Tensor iota_map =
-            core::Tensor::Arange(0, num_blocks, 1, core::Int32, device);
-    inverse_index_map.IndexSet({active_buf_indices_i32.To(core::Int64)},
-                               iota_map);
+    core::Tensor inverse_index_map;
+    BuildMeshInverseIndexMap(active_buf_indices_i32,
+                             block_hashmap_->GetCapacity(), device,
+                             inverse_index_map);
 
     core::Tensor vertices, triangles, vertex_normals, vertex_colors;
     core::Tensor block_keys = block_hashmap_->GetKeyTensor();
@@ -701,15 +751,17 @@ TriangleMesh VoxelBlockGrid::ExtractTriangleMeshIncluding(
     core::Tensor active_nb_buf_indices, active_nb_masks;
     std::tie(active_nb_buf_indices, active_nb_masks) =
             BufferRadiusNeighbors(block_hashmap_, active_buf_indices_i32);
+    // Cover neighbor blocks in inverse_index_map (marching-cubes safety).
+    active_buf_indices_i32 = ExpandActiveBufIndicesWithNeighbors(
+            active_buf_indices_i32, active_nb_buf_indices, active_nb_masks);
+    std::tie(active_nb_buf_indices, active_nb_masks) =
+            BufferRadiusNeighbors(block_hashmap_, active_buf_indices_i32);
 
     core::Device device = block_hashmap_->GetDevice();
-    int64_t num_blocks = block_hashmap_->Size();
-    core::Tensor inverse_index_map({block_hashmap_->GetCapacity()}, core::Int32,
-                                   device);
-    core::Tensor iota_map =
-            core::Tensor::Arange(0, num_blocks, 1, core::Int32, device);
-    inverse_index_map.IndexSet({active_buf_indices_i32.To(core::Int64)},
-                               iota_map);
+    core::Tensor inverse_index_map;
+    BuildMeshInverseIndexMap(active_buf_indices_i32,
+                             block_hashmap_->GetCapacity(), device,
+                             inverse_index_map);
 
     core::Tensor vertices, triangles, vertex_normals, vertex_colors;
     core::Tensor block_keys = block_hashmap_->GetKeyTensor();

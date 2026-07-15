@@ -437,16 +437,34 @@ private:
                 render_pcd.GetAxisAlignedBoundingBox().ToLegacy());
     }
 
-    void AddRegionPair(const DisplayState::RegionPair& pair) {
+    void UpsertRegionPair(const DisplayState::RegionPair& pair) {
         using namespace rendering;
         auto* scene = GetOpen3DScene();
 
+        int existing_idx = -1;
+        for (size_t i = 0; i < region_entries_.size(); ++i) {
+            if (region_entries_[i].id == pair.id) {
+                existing_idx = static_cast<int>(i);
+                break;
+            }
+        }
+
         RegionSceneEntry entry;
-        entry.id = pair.id;
-        entry.mesh_name = "region_" + std::to_string(pair.id) + "_mesh";
-        entry.pcd_name = "region_" + std::to_string(pair.id) + "_pcd";
+        if (existing_idx >= 0) {
+            entry = region_entries_[existing_idx];
+        } else {
+            entry.id = pair.id;
+            entry.mesh_name = "region_" + std::to_string(pair.id) + "_mesh";
+            entry.pcd_name = "region_" + std::to_string(pair.id) + "_pcd";
+        }
+
+        const bool had_mesh =
+                existing_idx >= 0 && region_geometry_[existing_idx].has_mesh;
 
         StoredRegionGeometry stored;
+        if (existing_idx >= 0) {
+            stored = region_geometry_[existing_idx];
+        }
         if (pair.mesh && !pair.mesh->IsEmpty()) {
             MaterialRecord mesh_mat;
             mesh_mat.shader = "defaultLit";
@@ -475,13 +493,29 @@ private:
             }
         }
 
-        region_geometry_.push_back(std::move(stored));
-        region_entries_.push_back(entry);
+        if (existing_idx >= 0) {
+            region_geometry_[existing_idx] = std::move(stored);
+            if (stored.has_mesh && !had_mesh) {
+                utility::LogInfo("Updated region {} mesh (was empty).", pair.id);
+            } else {
+                utility::LogInfo(
+                        "Updated region {} pair in scene (mesh: {}, pcd: {}).",
+                        pair.id, pair.mesh ? pair.mesh->vertices_.size() : 0,
+                        pair.pcd ? pair.pcd->points_.size() : 0);
+            }
+        } else {
+            region_geometry_.push_back(std::move(stored));
+            region_entries_.push_back(entry);
+            utility::LogInfo(
+                    "Added region {} pair to scene (mesh: {}, pcd: {}).",
+                    pair.id, pair.mesh ? pair.mesh->vertices_.size() : 0,
+                    pair.pcd ? pair.pcd->points_.size() : 0);
+        }
         ApplyRegionVisibility();
-        utility::LogInfo(
-                "Added region {} pair to scene (mesh: {}, pcd: {}).", pair.id,
-                pair.mesh ? pair.mesh->vertices_.size() : 0,
-                pair.pcd ? pair.pcd->points_.size() : 0);
+    }
+
+    void AddRegionPair(const DisplayState::RegionPair& pair) {
+        UpsertRegionPair(pair);
     }
 
     void UpdateLostCameraMarker(std::shared_ptr<geometry::LineSet> marker,

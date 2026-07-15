@@ -187,7 +187,7 @@ bool RealSenseSensor::InitSensor(const RealSenseSensorConfig& sensor_config,
     RealSenseSensorConfig::GetPixelDtypes(profile, metadata_);
     return true;
 } catch (const rs2::error& e) {
-    utility::LogError(
+    utility::LogWarning(
             "Invalid RealSense camera configuration, or camera not connected:"
             "\n{}: {}",
             rs2_exception_type_to_string(e.get_type()), e.what());
@@ -218,8 +218,11 @@ bool RealSenseSensor::StartCapture(bool start_record) {
         }
         return true;
     } catch (const rs2::error& e) {
-        utility::LogError("StartCapture() failed: {}: {}",
-                          rs2_exception_type_to_string(e.get_type()), e.what());
+        // Prefer warning so callers can retry without an uncaught LogError abort.
+        utility::LogWarning("StartCapture() failed: {}: {}",
+                            rs2_exception_type_to_string(e.get_type()),
+                            e.what());
+        is_capturing_ = false;
         return false;
     }
 }

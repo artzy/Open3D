@@ -44,11 +44,12 @@ struct BlockKeyHash {
 std::unordered_set<BlockKey, BlockKeyHash> BuildBlockKeySet(
         const core::Tensor& block_keys) {
     std::unordered_set<BlockKey, BlockKeyHash> key_set;
-    if (block_keys.NumElements() == 0) {
+    // Tensor({}) is 0-D with NumElements()==1; only (N,3) N>0 is valid.
+    if (block_keys.NumDims() < 1 || block_keys.GetShape()[0] == 0) {
         return key_set;
     }
     core::Tensor keys_cpu = block_keys.To(core::Device("CPU:0")).Contiguous();
-    const int64_t n = keys_cpu.GetLength();
+    const int64_t n = keys_cpu.GetShape()[0];
     const int32_t* data = keys_cpu.GetDataPtr<int32_t>();
     key_set.reserve(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) {
@@ -65,6 +66,9 @@ core::Tensor MergeBlockKeys(const core::Tensor& existing_keys,
             BuildBlockKeySet(new_keys);
     merged.insert(incoming.begin(), incoming.end());
 
+    if (merged.empty()) {
+        return core::Tensor({0, 3}, core::Int32, core::Device("CPU:0"));
+    }
     std::vector<int32_t> flat;
     flat.reserve(merged.size() * 3);
     for (const auto& key : merged) {
@@ -175,7 +179,8 @@ t::geometry::TriangleMesh Model::ExtractTriangleMesh(float weight_threshold,
 }
 
 void Model::FreezeBlocks(const core::Tensor& block_keys) {
-    if (block_keys.NumElements() == 0) {
+    // Default Tensor() is 0-D (NumElements()==1); treat non-2D or 0-rows as empty.
+    if (block_keys.NumDims() < 1 || block_keys.GetShape()[0] == 0) {
         return;
     }
     frozen_block_keys_ = MergeBlockKeys(frozen_block_keys_, block_keys);
@@ -186,7 +191,8 @@ core::Tensor Model::GetFrozenBlockKeys() const { return frozen_block_keys_; }
 t::geometry::PointCloud Model::ExtractPointCloudExcludingFrozen(
         float weight_threshold,
         int estimated_number) {
-    if (frozen_block_keys_.NumElements() == 0) {
+    if (frozen_block_keys_.NumDims() < 1 ||
+        frozen_block_keys_.GetShape()[0] == 0) {
         return ExtractPointCloud(weight_threshold, estimated_number);
     }
     return voxel_grid_.ExtractPointCloudExcluding(weight_threshold,

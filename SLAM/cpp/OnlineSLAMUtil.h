@@ -29,7 +29,7 @@ using namespace open3d::visualization;
 // Filament upload budget for live preview (extract uses estimated_points).
 static constexpr int kMaxRenderPoints = 100000;
 // DBSCAN / object freeze input cap (large clouds can crash or hang).
-static constexpr int kMaxSegmentationPoints = 200000;
+static constexpr int kMaxSegmentationPoints = 60000;
 
 // Tracking tiers: strict pose update vs weak integrate-only vs reject outlier jumps.
 static constexpr double kPoseFitnessMin = 0.15;
@@ -732,6 +732,17 @@ protected:
     t::geometry::PointCloud pending_segmentation_pcd_;
     int pending_segmentation_frame_id_ = 0;
     float pending_segmentation_extract_weight_ = 3.0f;
+    t::geometry::PointCloud last_segmentation_pcd_;
+    int last_segmentation_frame_id_ = 0;
+    float last_segmentation_extract_weight_ = 3.0f;
+    bool have_last_segmentation_pcd_ = false;
+    double motion_window_translation_m_ = 0.0;
+    double motion_window_rotation_deg_ = 0.0;
+    bool camera_moved_for_regions_ = false;
+    core::Tensor motion_anchor_T_;
+    int64_t motion_anchor_hash_ = 0;
+    bool have_motion_anchor_ = false;
+    std::vector<object_mesh::FrozenObjectCandidate> committed_region_meshes_;
 
     RegionSettings region_settings_;
     std::vector<object_mesh::RegionRecord> region_records_;
@@ -775,7 +786,8 @@ protected:
                         static_cast<float>(prop_values_.voxel_size.load()),
                         static_cast<float>(prop_values_.trunc_multiplier.load()),
                         extract_weight, region_settings_.min_points,
-                        region_settings_.stability_frames, 4.0);
+                        region_settings_.stability_frames, region_settings_,
+                        4.0);
         if (exit_on_empty_frame_) {
             // Dataset playback integrates the full scene quickly; relax matching
             // so cluster signatures stay stable while the map still refines.
@@ -796,12 +808,6 @@ protected:
         return std::min(3.f, std::max(0.5f, static_cast<float>(frame_id) * 0.01f));
     }
 
-    /// Match RealTimeSLAMRealSense region extract: higher weight avoids
-    /// segmenting the entire map on early file-playback frames.
-    static float RegionExtractWeightThreshold(int frame_id) {
-        return std::max(1.0f, std::min(static_cast<float>(frame_id), 3.0f));
-    }
-
     void QueueSegmentationCloud(t::geometry::PointCloud region_pcd,
                                 int frame_id,
                                 float extract_weight) {
@@ -810,6 +816,10 @@ protected:
             pending_segmentation_pcd_ = std::move(region_pcd);
             pending_segmentation_frame_id_ = frame_id;
             pending_segmentation_extract_weight_ = extract_weight;
+            last_segmentation_pcd_ = pending_segmentation_pcd_;
+            last_segmentation_frame_id_ = frame_id;
+            last_segmentation_extract_weight_ = extract_weight;
+            have_last_segmentation_pcd_ = true;
             segmentation_requested_ = true;
         }
         segmentation_cv_.notify_one();
@@ -854,7 +864,7 @@ protected:
         mesh_mat.shader = "defaultLit";
         mesh_mat.sRGB_vertex_color = true;
         for (const auto& obj : new_objects) {
-            if (!obj.mesh.HasVertexPositions()) {
+            if (!object_mesh::IsValidRegionMesh(obj.mesh)) {
                 continue;
             }
             const std::string name =
@@ -882,25 +892,43 @@ protected:
     }
 
     void SegmentationWorker() {
-        while (!is_done_) {
+        bool exit_flush_done = false;
+        while (true) {
             t::geometry::PointCloud segmentation_pcd;
             int frame_id = 0;
             float extract_weight = 3.0f;
+            bool process_request = false;
+            bool session_stopping = false;
             {
                 std::unique_lock<std::mutex> lock(segmentation_mutex_);
                 segmentation_cv_.wait(lock, [this]() {
                     return segmentation_requested_ || is_done_;
                 });
-                if (is_done_) {
+                session_stopping = is_done_;
+                if (segmentation_requested_) {
+                    segmentation_requested_ = false;
+                    segmentation_pcd = pending_segmentation_pcd_;
+                    frame_id = pending_segmentation_frame_id_;
+                    extract_weight = pending_segmentation_extract_weight_;
+                    process_request = true;
+                } else if (session_stopping && !exit_flush_done &&
+                           region_settings_.flush_holey_on_exit &&
+                           have_last_segmentation_pcd_) {
+                    segmentation_pcd = last_segmentation_pcd_;
+                    frame_id = last_segmentation_frame_id_;
+                    extract_weight = last_segmentation_extract_weight_;
+                    process_request = true;
+                    exit_flush_done = true;
+                } else {
                     break;
                 }
-                segmentation_requested_ = false;
-                segmentation_pcd = pending_segmentation_pcd_;
-                frame_id = pending_segmentation_frame_id_;
-                extract_weight = pending_segmentation_extract_weight_;
             }
 
-            if (!is_started_ || !model_ || segmentation_pcd.IsEmpty()) {
+            if (!process_request || !is_started_ || !model_ ||
+                segmentation_pcd.IsEmpty()) {
+                if (session_stopping) {
+                    break;
+                }
                 continue;
             }
 
@@ -912,6 +940,9 @@ protected:
                 if (region_settings_.enabled) {
                     object_mesh::SegmentationConfig config =
                             BuildRegionSegmentationConfig(extract_weight);
+                    config.camera_moved_since_last_check =
+                            camera_moved_for_regions_ ||
+                            !region_settings_.require_camera_motion;
                     freeze_tracker_.SetConfig(config);
 
                     std::vector<object_mesh::FrozenObjectCandidate> ready;
@@ -923,47 +954,60 @@ protected:
                         utility::LogInfo(
                                 "Region check frame {}: surface segmented, "
                                 "waiting for stable cluster (tracked {}, "
-                                "frozen {}).",
+                                "pending {}, holey {}, frozen {}).",
                                 frame_id, freeze_tracker_.TrackedCount(),
+                                freeze_tracker_.PendingCount(),
+                                freeze_tracker_.PendingHoleyCount(),
                                 freeze_tracker_.FrozenCount());
                     }
 
-                    std::vector<object_mesh::FrozenObjectCandidate> frozen_now;
-                    for (auto& candidate : ready) {
-                        const t::geometry::PointCloud region_cluster =
-                                candidate.source_cluster;
-                        try {
-                            {
-                                std::lock_guard<std::mutex> model_lock(
-                                        model_mutex_);
-                                object_mesh::ApplyFreezeAndExtractMesh(
-                                        candidate, *model_, config);
-                            }
-                            if (candidate.mesh.HasVertexPositions() ||
-                                region_cluster.HasPointPositions()) {
-                                candidate.source_cluster = region_cluster;
-                                frozen_now.push_back(std::move(candidate));
-                            }
-                        } catch (const std::exception& e) {
-                            utility::LogWarning(
-                                    "Region freeze skipped for candidate {} "
-                                    "at frame {}: {}",
-                                    candidate.id, frame_id, e.what());
-                        }
+                    object_mesh::RegionProcessResult processed;
+                    {
+                        std::lock_guard<std::mutex> model_lock(model_mutex_);
+                        processed = object_mesh::ProcessPendingRegionCandidates(
+                                ready, *model_, freeze_tracker_, config,
+                                session_stopping, committed_region_meshes_);
                     }
 
-                    if (frozen_now.empty()) {
+                    if (!processed.seam_updates.empty()) {
+                        std::vector<FrozenObjectEntry> seam_objects;
+                        for (auto& seam : processed.seam_updates) {
+                            FrozenObjectEntry entry;
+                            entry.id = seam.id;
+                            entry.mesh = seam.mesh;
+                            entry.block_keys = seam.block_keys;
+                            seam_objects.push_back(entry);
+                            for (auto& stored : committed_region_meshes_) {
+                                if (stored.id == seam.id) {
+                                    stored.mesh = seam.mesh;
+                                    break;
+                                }
+                            }
+                        }
+                        gui::Application::GetInstance().PostToMainThread(
+                                this, [this, seam_objects]() {
+                                    AddFrozenMeshesToScene(seam_objects);
+                                });
+                    }
+
+                    if (processed.committed.empty()) {
                         utility::LogInfo(
                                 "Region check frame {}: {} candidate(s) "
-                                "tracked, none ready to freeze yet.",
-                                frame_id, static_cast<int>(ready.size()));
+                                "tracked, none ready to freeze yet (deferred "
+                                "holey {} void {} stationary {}).",
+                                frame_id, static_cast<int>(ready.size()),
+                                processed.deferred_holey, processed.deferred_void,
+                                processed.deferred_stationary);
+                        if (session_stopping && exit_flush_done) {
+                            break;
+                        }
                         continue;
                     }
 
                     std::vector<FrozenObjectEntry> new_objects;
                     {
                         std::lock_guard<std::mutex> lock(region_records_mutex_);
-                        for (auto& candidate : frozen_now) {
+                        for (auto& candidate : processed.committed) {
                             object_mesh::RegionRecord record;
                             if (!object_mesh::SaveFrozenRegion(
                                         region_settings_, candidate, frame_id,
@@ -975,9 +1019,11 @@ protected:
                             FrozenObjectEntry entry;
                             entry.id = candidate.id;
                             entry.type = candidate.type;
-                            entry.mesh = std::move(candidate.mesh);
+                            entry.mesh = candidate.mesh;
                             entry.block_keys = candidate.block_keys;
-                            new_objects.push_back(std::move(entry));
+                            new_objects.push_back(entry);
+                            committed_region_meshes_.push_back(
+                                    std::move(candidate));
                         }
                         object_mesh::WriteRegionsJson(region_settings_.output_dir,
                                                       region_records_);
@@ -999,6 +1045,9 @@ protected:
                                     AddFrozenMeshesToScene(new_objects);
                                 });
                     }
+                    if (session_stopping && exit_flush_done) {
+                        break;
+                    }
                     continue;
                 }
 
@@ -1012,9 +1061,11 @@ protected:
                             segmentation_pcd, *model_, freeze_tracker_, config,
                             next_object_id_);
                     for (auto& candidate : candidates) {
-                        if (!candidate.mesh.HasVertexPositions()) {
+                        if (!object_mesh::IsValidRegionMesh(candidate.mesh)) {
+                            freeze_tracker_.MarkFreezeFailed(candidate.id);
                             continue;
                         }
+                        freeze_tracker_.MarkFreezeCommitted(candidate.id);
                         FrozenObjectEntry entry;
                         entry.id = candidate.id;
                         entry.type = candidate.type;
@@ -1043,6 +1094,14 @@ protected:
             } catch (const std::exception& e) {
                 utility::LogWarning("Object segmentation failed: {}", e.what());
             }
+            if (session_stopping && exit_flush_done) {
+                break;
+            }
+        }
+        if (freeze_tracker_.PendingHoleyCount() > 0) {
+            utility::LogWarning(
+                    "Segmentation worker exiting with {} pending holey region(s).",
+                    freeze_tracker_.PendingHoleyCount());
         }
     }
 
@@ -1559,8 +1618,62 @@ protected:
                      idx % effective_interval == 0);
 
             if (ShouldCheckRegions(static_cast<int>(idx))) {
-                const float region_weight = RegionExtractWeightThreshold(
-                        static_cast<int>(idx));
+                if (!have_motion_anchor_) {
+                    motion_anchor_T_ = T_frame_to_model.Contiguous();
+                    motion_anchor_hash_ = hash_size;
+                    have_motion_anchor_ = true;
+                }
+
+                object_mesh::CameraMotionSample motion_sample;
+                object_mesh::RelativePoseMetrics(
+                        motion_anchor_T_, T_frame_to_model,
+                        motion_sample.net_translation_m,
+                        motion_sample.net_rotation_deg);
+                motion_sample.hash_delta = hash_size - motion_anchor_hash_;
+                if (motion_sample.hash_delta < 0) {
+                    motion_sample.hash_delta = 0;
+                }
+                motion_sample.frame_id = static_cast<int>(idx);
+
+                object_mesh::SegmentationConfig motion_cfg;
+                motion_cfg.require_camera_motion =
+                        region_settings_.require_camera_motion;
+                motion_cfg.min_motion_translation_m =
+                        region_settings_.min_motion_translation_m;
+                motion_cfg.min_motion_rotation_deg =
+                        region_settings_.min_motion_rotation_deg;
+                motion_cfg.min_hash_delta_blocks =
+                        region_settings_.min_hash_delta_blocks;
+                motion_cfg.region_motion_warmup_frames =
+                        region_settings_.region_motion_warmup_frames;
+
+                const bool camera_moved =
+                        object_mesh::CameraMovedEnough(motion_cfg, motion_sample);
+                camera_moved_for_regions_ = camera_moved;
+                motion_window_translation_m_ = motion_sample.net_translation_m;
+                motion_window_rotation_deg_ = motion_sample.net_rotation_deg;
+
+                if (!camera_moved) {
+                    if (static_cast<int>(idx) <
+                        region_settings_.region_motion_warmup_frames) {
+                        utility::LogInfo(
+                                "Region check skipped: motion warmup "
+                                "(frame {}/{}, net t={:.4f} m, r={:.2f} deg, "
+                                "dhash={}).",
+                                idx, region_settings_.region_motion_warmup_frames,
+                                motion_sample.net_translation_m,
+                                motion_sample.net_rotation_deg,
+                                motion_sample.hash_delta);
+                    } else {
+                        utility::LogInfo(
+                                "Region check skipped: camera nearly stationary "
+                                "(net t={:.4f} m, r={:.2f} deg, dhash={}).",
+                                motion_sample.net_translation_m,
+                                motion_sample.net_rotation_deg,
+                                motion_sample.hash_delta);
+                    }
+                } else {
+                const float region_weight = region_settings_.extract_weight;
                 try {
                     t::geometry::PointCloud region_pcd;
                     {
@@ -1569,22 +1682,52 @@ protected:
                                 region_weight, -1);
                         region_pcd = region_pcd.To(core::Device("CPU:0"));
                     }
-                    if (region_pcd.HasPointPositions()) {
-                        const int64_t region_points =
-                                region_pcd.GetPointPositions().GetLength();
+                    const int64_t before_filter =
+                            region_pcd.HasPointPositions()
+                                    ? region_pcd.GetPointPositions().GetLength()
+                                    : 0;
+                    const double band_max = std::min(
+                            region_settings_.depth_max_m,
+                            prop_values_.depth_max.load());
+                    if (before_filter > 0) {
+                        region_pcd =
+                                object_mesh::FilterPointCloudByCameraDistance(
+                                        region_pcd, T_frame_to_model,
+                                        region_settings_.depth_min_m, band_max);
+                    }
+                    const int64_t after_filter =
+                            region_pcd.HasPointPositions()
+                                    ? region_pcd.GetPointPositions().GetLength()
+                                    : 0;
+                    utility::LogInfo(
+                            "Region surface filtered: {} -> {} points "
+                            "(weight={}, depth=[{:.2f},{:.2f}] m).",
+                            before_filter, after_filter, region_weight,
+                            region_settings_.depth_min_m, band_max);
+                    if (after_filter > 0) {
                         QueueSegmentationCloud(std::move(region_pcd),
                                                static_cast<int>(idx),
                                                region_weight);
                         utility::LogInfo(
                                 "Region segmentation queued at frame {} ({} "
-                                "points).",
-                                idx, region_points);
+                                "points, net t={:.4f} m, r={:.2f} deg, "
+                                "dhash={}).",
+                                idx, after_filter,
+                                motion_sample.net_translation_m,
+                                motion_sample.net_rotation_deg,
+                                motion_sample.hash_delta);
+                        motion_anchor_T_ = T_frame_to_model.Contiguous();
+                        motion_anchor_hash_ = hash_size;
+                        have_motion_anchor_ = true;
+                        motion_window_translation_m_ = 0.0;
+                        motion_window_rotation_deg_ = 0.0;
                     }
                 } catch (const std::exception& e) {
                     utility::LogWarning(
                             "Region extract skipped at frame {}: {}", idx,
                             e.what());
                 }
+                }  // camera_moved
             }
 
             if (should_request_extract) {
