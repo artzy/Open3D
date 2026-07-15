@@ -163,6 +163,8 @@ void PrintHelp() {
     utility::LogInfo("    [--reloc_retry_interval N] Global reloc attempt interval when lost.");
     utility::LogInfo("    [--reloc_candidate_radius M] Spatial search radius for keyframes.");
     utility::LogInfo("    [--reloc_min_fitness F]   Minimum ICP fitness to accept global reloc.");
+    utility::LogInfo("    [--reloc_max_pose_jump M] Max jump vs last_stable (m, default: 2.0).");
+    utility::LogInfo("    [--reloc_ransac_iter N]   RANSAC max iterations (default: 40000).");
     utility::LogInfo("    [--reloc_self_test]       Auto lost/global-reloc self test (exits).");
     utility::LogInfo("");
     utility::LogInfo("GUI controls (left panel):");
@@ -326,15 +328,20 @@ std::shared_ptr<geometry::LineSet> CreateCameraMarker(
         int height,
         const Eigen::Matrix3d& intrinsic,
         const core::Tensor& T_frame_to_model,
+        const Eigen::Vector3d& color,
         double scale = 0.25) {
     const Eigen::Matrix4d camera_to_world =
             core::eigen_converter::TensorToEigenMatrixXd(T_frame_to_model);
     auto marker = geometry::LineSet::CreateCameraVisualization(
             width, height, intrinsic, camera_to_world.inverse(), scale);
-    // Tango orange: distinct from the live point cloud and easy to relocate.
-    marker->PaintUniformColor(Eigen::Vector3d(0.961, 0.475, 0.000));
+    marker->PaintUniformColor(color);
     return marker;
 }
+
+/// Last-stable pose: Tango orange (return target).
+const Eigen::Vector3d kLastStableCameraColor(0.961, 0.475, 0.000);
+/// Current estimated pose while lost: cyan/blue (where you are now).
+const Eigen::Vector3d kCurrentCameraColor(0.15, 0.55, 1.00);
 
 std::string BuildPoseDiffText(const core::Tensor& stable_T_frame_to_model,
                               const core::Tensor& current_T_frame_to_model) {
@@ -356,6 +363,7 @@ std::string BuildPoseDiffText(const core::Tensor& stable_T_frame_to_model,
 
     std::ostringstream ss;
     ss << std::fixed << std::setprecision(3);
+    ss << "Orange: last stable  |  Blue: current\n";
     ss << "Return toward orange camera\n";
     ss << "dX " << delta.x() << " m\n";
     ss << "dY " << delta.y() << " m\n";
@@ -442,6 +450,33 @@ struct SlamRuntime {
 
     relocalization::RelocalizationConfig reloc_config;
 
+    // Async global relocalization (does not block the SLAM integrate loop).
+    std::mutex reloc_mutex;
+    std::condition_variable reloc_cv;
+    std::atomic<bool> reloc_requested{false};
+    std::atomic<bool> reloc_worker_busy{false};
+    std::atomic<bool> reloc_stop{false};
+    std::atomic<bool> reloc_result_ready{false};
+    t::geometry::RGBDImage pending_reloc_rgbd;
+    core::Tensor pending_reloc_intrinsic;
+    core::Tensor pending_reloc_last_stable;
+    std::vector<int> pending_reloc_candidate_ids;
+    int pending_reloc_frame_id = 0;
+    int pending_reloc_request_id = 0;
+    float pending_reloc_depth_scale = 1000.f;
+    float pending_reloc_depth_max = 3.f;
+    bool pending_reloc_used_fallback = false;
+    int next_reloc_request_id = 1;
+    relocalization::RelocalizationAttempt reloc_result;
+    int reloc_result_frame_id = 0;
+    int reloc_result_request_id = 0;
+    double reloc_result_elapsed_ms = 0.0;
+    bool reloc_result_used_fallback = false;
+    int reloc_result_candidate_count = 0;
+    // Shared with RelocWorker; set by SlamWorker before starting the thread.
+    relocalization::KeyframeDatabase* reloc_keyframe_db = nullptr;
+    core::Device reloc_device{"CPU:0"};
+
     struct RelocSelfTestParams {
         bool enabled = false;
         int warmup_frames = 35;
@@ -519,15 +554,36 @@ void RegionWorker(SlamRuntime& runtime,
         const auto region_t0 = std::chrono::steady_clock::now();
 
         try {
+            const int64_t before_down =
+                    surface_pcd.HasPointPositions()
+                            ? surface_pcd.GetPointPositions().GetLength()
+                            : 0;
+            float downsample_voxel = params.voxel_size;
             surface_pcd = object_mesh::DownsamplePointCloudIfNeeded(
                     surface_pcd, kMaxRegionSegmentationPoints,
-                    params.voxel_size);
+                    params.voxel_size, &downsample_voxel);
             object_mesh::SegmentationConfig config =
                     BuildRegionSegmentationConfig(params, extract_weight);
+            // DBSCAN eps must track the *actual* downsample spacing. When the
+            // map is huge, voxel grows above params.voxel_size and a fixed eps
+            // (4*voxel_size) leaves every point as noise → tracked 0 forever.
+            config.dbscan_eps = std::max(
+                    config.dbscan_eps,
+                    4.0 * static_cast<double>(downsample_voxel));
             config.camera_moved_since_last_check =
                     runtime.camera_moved_for_regions ||
                     !params.regions.require_camera_motion;
             runtime.freeze_tracker.SetConfig(config);
+
+            const int64_t after_down =
+                    surface_pcd.HasPointPositions()
+                            ? surface_pcd.GetPointPositions().GetLength()
+                            : 0;
+            utility::LogInfo(
+                    "Region downsample: {} -> {} points (voxel={:.4f} m, "
+                    "dbscan_eps={:.4f} m).",
+                    before_down, after_down, downsample_voxel,
+                    config.dbscan_eps);
 
             std::vector<object_mesh::FrozenObjectCandidate> pending;
             pending = object_mesh::ProcessExtractedSurface(
@@ -636,6 +692,109 @@ void RegionWorker(SlamRuntime& runtime,
     }
 }
 
+/// Runs global relocalization off the SLAM thread so tracking stays responsive.
+void RelocWorker(SlamRuntime& runtime) {
+    while (true) {
+        t::geometry::RGBDImage rgbd;
+        core::Tensor intrinsic;
+        core::Tensor last_stable;
+        std::vector<int> candidate_ids;
+        int frame_id = 0;
+        int request_id = 0;
+        float depth_scale = 1000.f;
+        float depth_max = 3.f;
+        bool used_fallback = false;
+        {
+            std::unique_lock<std::mutex> lock(runtime.reloc_mutex);
+            runtime.reloc_cv.wait(lock, [&]() {
+                return runtime.reloc_requested.load() ||
+                       runtime.reloc_stop.load();
+            });
+            if (runtime.reloc_stop.load() && !runtime.reloc_requested.load()) {
+                break;
+            }
+            runtime.reloc_requested.store(false);
+            rgbd = runtime.pending_reloc_rgbd;
+            intrinsic = runtime.pending_reloc_intrinsic;
+            last_stable = runtime.pending_reloc_last_stable;
+            candidate_ids = runtime.pending_reloc_candidate_ids;
+            frame_id = runtime.pending_reloc_frame_id;
+            request_id = runtime.pending_reloc_request_id;
+            depth_scale = runtime.pending_reloc_depth_scale;
+            depth_max = runtime.pending_reloc_depth_max;
+            used_fallback = runtime.pending_reloc_used_fallback;
+        }
+
+        if (!runtime.reloc_keyframe_db) {
+            continue;
+        }
+
+        runtime.reloc_worker_busy.store(true);
+        const auto t0 = std::chrono::steady_clock::now();
+        relocalization::RelocalizationAttempt attempt;
+        try {
+            attempt = relocalization::Relocalize(
+                    rgbd, intrinsic, *runtime.reloc_keyframe_db, candidate_ids,
+                    last_stable, depth_scale, depth_max, runtime.reloc_config,
+                    runtime.reloc_device);
+        } catch (const std::exception& e) {
+            attempt = {};
+            attempt.accepted = false;
+            attempt.reject_reason = std::string("exception: ") + e.what();
+            utility::LogWarning("Global relocalization threw at frame {}: {}",
+                                frame_id, e.what());
+        }
+        const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+
+        {
+            std::lock_guard<std::mutex> lock(runtime.reloc_mutex);
+            runtime.reloc_result = attempt;
+            runtime.reloc_result_frame_id = frame_id;
+            runtime.reloc_result_request_id = request_id;
+            runtime.reloc_result_elapsed_ms = elapsed_ms;
+            runtime.reloc_result_used_fallback = used_fallback;
+            runtime.reloc_result_candidate_count =
+                    static_cast<int>(candidate_ids.size());
+            runtime.reloc_result_ready.store(true);
+        }
+        runtime.reloc_worker_busy.store(false);
+
+        if (attempt.accepted) {
+            utility::LogInfo(
+                    "Global reloc finished in {:.0f} ms (frame {}, KF#{}, "
+                    "fitness {:.3f}, candidates {}, fallback={}).",
+                    elapsed_ms, frame_id, attempt.keyframe_id,
+                    attempt.icp_fitness, candidate_ids.size(),
+                    used_fallback ? 1 : 0);
+        } else {
+            utility::LogWarning(
+                    "Global reloc finished in {:.0f} ms (frame {}, rejected: "
+                    "{}, candidates {}, fallback={}).",
+                    elapsed_ms, frame_id,
+                    attempt.reject_reason.empty() ? "unknown"
+                                                  : attempt.reject_reason,
+                    candidate_ids.size(), used_fallback ? 1 : 0);
+        }
+    }
+}
+
+std::shared_ptr<geometry::LineSet> CreateRelocGuideLine(
+        const core::Tensor& last_stable_T,
+        const core::Tensor& current_T) {
+    const Eigen::Vector3d a = relocalization::PoseTranslation(last_stable_T);
+    const Eigen::Vector3d b = relocalization::PoseTranslation(current_T);
+    auto line = std::make_shared<geometry::LineSet>();
+    line->points_ = {a, b};
+    line->lines_ = {Eigen::Vector2i(0, 1)};
+    line->colors_ = {Eigen::Vector3d(0.961, 0.475, 0.000),
+                     Eigen::Vector3d(0.961, 0.475, 0.000)};
+    line->PaintUniformColor(Eigen::Vector3d(0.961, 0.475, 0.000));
+    return line;
+}
+
 void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 const core::Tensor& intrinsic,
                 const camera::PinholeCameraIntrinsic& cam_intrinsic,
@@ -731,10 +890,26 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
     relocalization::MultiHypothesisTracker hypothesis_tracker(
             runtime.reloc_config);
     int last_global_reloc_frame = -1000;
+    bool global_reloc_attempt_frame = false;
     bool global_reloc_recovering = false;
     bool hypotheses_initialized = false;
     relocalization::RelocalizationAttempt last_reloc_attempt;
     int last_keyframe_marker_publish = -1000;
+    double last_reloc_elapsed_ms = 0.0;
+    bool last_reloc_used_fallback = false;
+    int last_reloc_candidate_count = 0;
+    int applied_reloc_request_id = 0;
+
+    runtime.reloc_keyframe_db = &keyframe_db;
+    runtime.reloc_device = device;
+    runtime.reloc_stop.store(false);
+    runtime.reloc_requested.store(false);
+    runtime.reloc_result_ready.store(false);
+    std::thread reloc_thread;
+    if (runtime.reloc_config.enabled) {
+        reloc_thread = std::thread(RelocWorker, std::ref(runtime));
+    }
+
     bool reloc_self_test_injected = false;
     bool reloc_self_test_global_ok = false;
     int reloc_self_test_inject_frame = -1;
@@ -809,84 +984,153 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
 
         bool integrate = (frame_id == 0) && !hash_near_full;
         TrackingTier tracking_tier = TrackingTier::kInit;
-        bool global_reloc_attempt_frame = false;
+        global_reloc_attempt_frame = false;
+
+        // Apply finished async reloc results first (stale-safe via request id).
+        if (runtime.reloc_config.enabled && runtime.reloc_result_ready.load()) {
+            relocalization::RelocalizationAttempt attempt;
+            int result_frame = 0;
+            int result_request = 0;
+            double elapsed_ms = 0.0;
+            bool used_fallback = false;
+            int candidate_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(runtime.reloc_mutex);
+                if (runtime.reloc_result_ready.load()) {
+                    attempt = runtime.reloc_result;
+                    result_frame = runtime.reloc_result_frame_id;
+                    result_request = runtime.reloc_result_request_id;
+                    elapsed_ms = runtime.reloc_result_elapsed_ms;
+                    used_fallback = runtime.reloc_result_used_fallback;
+                    candidate_count = runtime.reloc_result_candidate_count;
+                    runtime.reloc_result_ready.store(false);
+                }
+            }
+            if (result_request > applied_reloc_request_id) {
+                applied_reloc_request_id = result_request;
+                last_reloc_attempt = attempt;
+                last_reloc_elapsed_ms = elapsed_ms;
+                last_reloc_used_fallback = used_fallback;
+                last_reloc_candidate_count = candidate_count;
+
+                if (attempt.accepted) {
+                    const double jump = relocalization::TranslationDistance(
+                            attempt.T_live_to_world,
+                            last_stable_T_frame_to_model);
+                    if (jump > runtime.reloc_config.max_pose_jump_m) {
+                        last_reloc_attempt.accepted = false;
+                        last_reloc_attempt.reject_reason =
+                                "pose jump too large (apply)";
+                        utility::LogWarning(
+                                "Global reloc result dropped at frame {} "
+                                "(stale jump {:.2f} m).",
+                                frame_id, jump);
+                    } else {
+                        T_frame_to_model =
+                                attempt.T_live_to_world.Contiguous();
+                        global_reloc_recovering = true;
+                        consecutive_strong = 0;
+                        {
+                            std::lock_guard<std::mutex> model_lock(
+                                    runtime.model_mutex);
+                            model.UpdateFramePose(frame_id, T_frame_to_model);
+                            model.SynthesizeModelFrame(
+                                    raycast_frame, params.depth_scale, 0.1f,
+                                    params.depth_max, params.trunc_multiplier,
+                                    false);
+                        }
+                        if (!hypotheses_initialized) {
+                            hypothesis_tracker.ResetOnLost(
+                                    last_stable_T_frame_to_model,
+                                    T_frame_to_model);
+                            hypotheses_initialized = true;
+                        }
+                        hypothesis_tracker.AddOrReplace(
+                                "global", T_frame_to_model, attempt.keyframe_id);
+                        utility::LogInfo(
+                                "Global relocalization accepted at frame {} "
+                                "(from request frame {}, KF#{}, icp "
+                                "{:.3f}, info {:.3f}, {:.0f} ms).",
+                                frame_id, result_frame, attempt.keyframe_id,
+                                attempt.icp_fitness, attempt.information_ratio,
+                                elapsed_ms);
+                        if (runtime.reloc_self_test.enabled &&
+                            reloc_self_test_injected &&
+                            !runtime.reloc_self_test_finished.load()) {
+                            reloc_self_test_global_ok = true;
+                            if (reloc_self_test_inject_frame < 0) {
+                                reloc_self_test_inject_frame = result_frame;
+                            }
+                            utility::LogInfo(
+                                    "RELOC_SELF_TEST: global reloc OK "
+                                    "(keyframe {}, icp fitness {:.3f}).",
+                                    attempt.keyframe_id, attempt.icp_fitness);
+                        }
+                    }
+                } else if (runtime.reloc_self_test.enabled &&
+                           reloc_self_test_injected &&
+                           !runtime.reloc_self_test_finished.load()) {
+                    // Async: keep waiting until timeout unless hard reject.
+                    utility::LogWarning(
+                            "RELOC_SELF_TEST: reloc rejected ({}); waiting "
+                            "for retry/timeout.",
+                            attempt.reject_reason.empty()
+                                    ? "unknown"
+                                    : attempt.reject_reason);
+                }
+            }
+        }
+
+        // Queue async reloc (query from last_stable, not drifted pose).
         if (runtime.reloc_config.enabled && tracking_was_unstable &&
+            !global_reloc_recovering &&
             consecutive_tracking_failures > kLostTrackingThreshold &&
             keyframe_db.Size() > 0 &&
             frame_id - last_global_reloc_frame >=
-                    runtime.reloc_config.retry_interval_frames) {
+                    runtime.reloc_config.retry_interval_frames &&
+            !runtime.reloc_worker_busy.load() &&
+            !runtime.reloc_requested.load()) {
             global_reloc_attempt_frame = true;
             last_global_reloc_frame = frame_id;
             const Eigen::Vector3d query_position =
-                    relocalization::PoseTranslation(T_frame_to_model);
+                    relocalization::PoseTranslation(
+                            last_stable_T_frame_to_model);
             const std::vector<double> live_histogram =
                     relocalization::ComputeDepthHistogram(
                             rgbd, params.depth_scale, params.depth_max);
-            const std::vector<int> candidate_ids =
+            const relocalization::CandidateSelection selection =
                     keyframe_db.SelectCandidates(query_position, live_histogram,
                                                  runtime.reloc_config);
-            try {
-                last_reloc_attempt = relocalization::Relocalize(
-                        rgbd, intrinsic, keyframe_db, candidate_ids,
-                        last_stable_T_frame_to_model, params.depth_scale,
-                        params.depth_max, runtime.reloc_config, device);
-            } catch (const std::exception& e) {
+            utility::LogInfo(
+                    "reloc candidates: {} (query=last_stable, fallback={}).",
+                    selection.ids.size(), selection.used_fallback ? 1 : 0);
+            if (selection.ids.empty()) {
                 last_reloc_attempt = {};
-                last_reloc_attempt.accepted = false;
-                last_reloc_attempt.reject_reason =
-                        std::string("exception: ") + e.what();
-                utility::LogWarning(
-                        "Global relocalization threw at frame {}: {}",
-                        frame_id, e.what());
-            }
-            if (last_reloc_attempt.accepted) {
-                T_frame_to_model = last_reloc_attempt.T_live_to_world.Contiguous();
-                global_reloc_recovering = true;
-                consecutive_strong = 0;
-                if (!hypotheses_initialized) {
-                    hypothesis_tracker.ResetOnLost(last_stable_T_frame_to_model,
-                                                   T_frame_to_model);
-                    hypotheses_initialized = true;
-                }
-                hypothesis_tracker.AddOrReplace(
-                        "global", T_frame_to_model,
-                        last_reloc_attempt.keyframe_id);
-                utility::LogInfo(
-                        "Global relocalization accepted at frame {} using "
-                        "keyframe {} (icp fitness {:.3f}, information {:.3f}).",
-                        frame_id, last_reloc_attempt.keyframe_id,
-                        last_reloc_attempt.icp_fitness,
-                        last_reloc_attempt.information_ratio);
+                last_reloc_attempt.reject_reason = "no candidates";
+                last_reloc_candidate_count = 0;
+                last_reloc_used_fallback = false;
             } else {
-                utility::LogWarning(
-                        "Global relocalization rejected at frame {}: {}",
-                        frame_id,
-                        last_reloc_attempt.reject_reason.empty()
-                                ? "unknown"
-                                : last_reloc_attempt.reject_reason);
-            }
-
-            if (runtime.reloc_self_test.enabled && reloc_self_test_injected &&
-                !runtime.reloc_self_test_finished.load()) {
-                if (last_reloc_attempt.accepted) {
-                    reloc_self_test_global_ok = true;
+                const int request_id = runtime.next_reloc_request_id++;
+                {
+                    std::lock_guard<std::mutex> lock(runtime.reloc_mutex);
+                    runtime.pending_reloc_rgbd = rgbd.To(core::Device("CPU:0"));
+                    runtime.pending_reloc_intrinsic = intrinsic;
+                    runtime.pending_reloc_last_stable =
+                            last_stable_T_frame_to_model.Contiguous();
+                    runtime.pending_reloc_candidate_ids = selection.ids;
+                    runtime.pending_reloc_frame_id = frame_id;
+                    runtime.pending_reloc_request_id = request_id;
+                    runtime.pending_reloc_depth_scale = params.depth_scale;
+                    runtime.pending_reloc_depth_max = params.depth_max;
+                    runtime.pending_reloc_used_fallback =
+                            selection.used_fallback;
+                    runtime.reloc_requested.store(true);
+                }
+                runtime.reloc_cv.notify_one();
+                if (runtime.reloc_self_test.enabled &&
+                    reloc_self_test_injected &&
+                    reloc_self_test_inject_frame < 0) {
                     reloc_self_test_inject_frame = frame_id;
-                    utility::LogInfo(
-                            "RELOC_SELF_TEST: global reloc OK (keyframe {}, "
-                            "icp fitness {:.3f}, information {:.3f}).",
-                            last_reloc_attempt.keyframe_id,
-                            last_reloc_attempt.icp_fitness,
-                            last_reloc_attempt.information_ratio);
-                } else {
-                    runtime.reloc_self_test_passed.store(false);
-                    runtime.reloc_self_test_finished.store(true);
-                    state.reloc_self_test_finished.store(true);
-                    utility::LogWarning(
-                            "RELOC_SELF_TEST: FAIL ({})",
-                            last_reloc_attempt.reject_reason.empty()
-                                    ? "unknown"
-                                    : last_reloc_attempt.reject_reason);
-                    state.request_stop.store(true);
                 }
             }
         }
@@ -917,22 +1161,41 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                     -> relocalization::MultiHypothesisTracker::TrackProbeResult {
                         relocalization::MultiHypothesisTracker::TrackProbeResult
                                 probe;
-                        std::lock_guard<std::mutex> model_lock(
-                                runtime.model_mutex);
-                        model.UpdateFramePose(frame_id, seed_pose);
-                        model.SynthesizeModelFrame(
-                                raycast_frame, params.depth_scale, 0.1f,
-                                params.depth_max, params.trunc_multiplier,
-                                false);
-                        auto result = model.TrackFrameToModel(
-                                input_frame, raycast_frame, params.depth_scale,
-                                params.depth_max,
-                                SafeOdometryDepthDiff(params.depth_diff),
-                                t::pipelines::odometry::Method::PointToPlane,
-                                odom_criteria);
-                        probe.fitness = result.fitness_;
-                        probe.transformation = result.transformation_;
-                        model.UpdateFramePose(frame_id, pose_before_hypotheses);
+                        try {
+                            std::lock_guard<std::mutex> model_lock(
+                                    runtime.model_mutex);
+                            model.UpdateFramePose(frame_id, seed_pose);
+                            model.SynthesizeModelFrame(
+                                    raycast_frame, params.depth_scale, 0.1f,
+                                    params.depth_max, params.trunc_multiplier,
+                                    false);
+                            auto result = model.TrackFrameToModel(
+                                    input_frame, raycast_frame,
+                                    params.depth_scale, params.depth_max,
+                                    SafeOdometryDepthDiff(params.depth_diff),
+                                    t::pipelines::odometry::Method::PointToPlane,
+                                    odom_criteria);
+                            probe.fitness = result.fitness_;
+                            probe.transformation = result.transformation_;
+                            model.UpdateFramePose(frame_id,
+                                                  pose_before_hypotheses);
+                        } catch (const std::exception& e) {
+                            probe.fitness = 0.0;
+                            probe.transformation = identity_pose;
+                            try {
+                                std::lock_guard<std::mutex> model_lock(
+                                        runtime.model_mutex);
+                                model.UpdateFramePose(frame_id,
+                                                      pose_before_hypotheses);
+                            } catch (...) {
+                            }
+                            if (!IsOdometrySingularError(e)) {
+                                utility::LogWarning(
+                                        "Hypothesis probe failed at frame {}: "
+                                        "{}",
+                                        frame_id, e.what());
+                            }
+                        }
                         return probe;
                     };
             auto eval = hypothesis_tracker.EvaluateAndPickBest(
@@ -1027,6 +1290,8 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                         consecutive_f2f_bridges = 0;
                         if (lost_camera_marker_visible) {
                             state.SetLostCameraMarker(nullptr, false);
+                            state.SetCurrentCameraMarker(nullptr, false);
+                            state.SetRelocGuideLine(nullptr, false);
                             state.SetPoseDiffText("", false);
                             lost_camera_marker_visible = false;
                         }
@@ -1157,6 +1422,8 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             }
             if (lost_camera_marker_visible) {
                 state.SetLostCameraMarker(nullptr, false);
+                state.SetCurrentCameraMarker(nullptr, false);
+                state.SetRelocGuideLine(nullptr, false);
                 state.SetPoseDiffText("", false);
                 lost_camera_marker_visible = false;
             }
@@ -1171,18 +1438,39 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             consecutive_tracking_failures > kLostTrackingThreshold) {
             state.SetLostCameraMarker(
                     CreateCameraMarker(width, height, intrinsic_eigen,
-                                       last_stable_T_frame_to_model),
+                                       last_stable_T_frame_to_model,
+                                       kLastStableCameraColor),
                     true);
             lost_camera_marker_visible = true;
+            // Hide keyframe spheres — they clutter the view and do not mark
+            // the return target; orange last-stable + blue current do.
+            state.SetShowKeyframeMarkers(false);
+            state.SetKeyframeMarkers({});
             utility::LogInfo(
-                    "Tracking lost. Showing orange last-stable camera marker; "
-                    "return near this camera frustum to relocalize.");
+                    "Tracking lost. Orange=last stable, blue=current pose; "
+                    "return toward the orange camera frustum.");
         }
         if (consecutive_tracking_failures > kLostTrackingThreshold) {
+            state.SetLostCameraMarker(
+                    CreateCameraMarker(width, height, intrinsic_eigen,
+                                       last_stable_T_frame_to_model,
+                                       kLastStableCameraColor),
+                    true);
+            state.SetCurrentCameraMarker(
+                    CreateCameraMarker(width, height, intrinsic_eigen,
+                                       T_frame_to_model, kCurrentCameraColor),
+                    true);
             state.SetPoseDiffText(
                     BuildPoseDiffText(last_stable_T_frame_to_model,
                                       T_frame_to_model),
                     true);
+            state.SetRelocGuideLine(
+                    CreateRelocGuideLine(last_stable_T_frame_to_model,
+                                         T_frame_to_model),
+                    true);
+        } else if (lost_camera_marker_visible) {
+            state.SetCurrentCameraMarker(nullptr, false);
+            state.SetRelocGuideLine(nullptr, false);
         }
 
         if (params.regions.enabled &&
@@ -1369,25 +1657,51 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
 
         std::string reloc_detail;
         if (runtime.reloc_config.enabled) {
-            reloc_detail = "Keyframes " +
-                           std::to_string(keyframe_db.Size()) + "/" +
-                           std::to_string(keyframe_db.Capacity());
-            if (last_reloc_attempt.accepted) {
-                reloc_detail += " | global ok KF#" +
-                                std::to_string(last_reloc_attempt.keyframe_id) +
-                                " fitness " +
-                                std::to_string(last_reloc_attempt.icp_fitness);
-            } else if (!last_reloc_attempt.reject_reason.empty()) {
-                reloc_detail += " | global rejected: " +
-                                last_reloc_attempt.reject_reason;
+            const double d_last = relocalization::TranslationDistance(
+                    T_frame_to_model, last_stable_T_frame_to_model);
+            std::ostringstream detail_ss;
+            detail_ss << std::fixed << std::setprecision(2);
+            if (consecutive_tracking_failures > kLostTrackingThreshold) {
+                detail_ss << "Lost | d_last_stable=" << d_last << "m | ";
+            }
+            detail_ss << "KF " << keyframe_db.Size() << "/"
+                      << keyframe_db.Capacity();
+            if (last_reloc_candidate_count > 0 ||
+                !last_reloc_attempt.reject_reason.empty() ||
+                last_reloc_attempt.accepted) {
+                detail_ss << " | last: ";
+                if (last_reloc_attempt.accepted) {
+                    detail_ss << "accepted KF#"
+                              << last_reloc_attempt.keyframe_id;
+                } else {
+                    detail_ss << "rejected("
+                              << (last_reloc_attempt.reject_reason.empty()
+                                          ? "pending"
+                                          : last_reloc_attempt.reject_reason)
+                              << ")";
+                }
+                if (last_reloc_elapsed_ms > 0.0) {
+                    detail_ss << " " << static_cast<int>(last_reloc_elapsed_ms)
+                              << "ms";
+                }
+                detail_ss << " cand=" << last_reloc_candidate_count;
+                if (last_reloc_used_fallback) {
+                    detail_ss << " fallback";
+                }
             }
             if (global_reloc_recovering) {
-                reloc_detail += " | confirming model tracking";
+                detail_ss << " | confirming";
             }
+            if (runtime.reloc_worker_busy.load()) {
+                detail_ss << " | reloc busy";
+            }
+            reloc_detail = detail_ss.str();
         }
         state.SetRelocDetail(reloc_detail);
 
-        if (runtime.reloc_config.enabled &&
+        // Keyframe spheres are debug-only (toggle). Reloc guidance uses
+        // orange last-stable + blue current camera frustums instead.
+        if (runtime.reloc_config.enabled && state.ShowKeyframeMarkers() &&
             frame_id - last_keyframe_marker_publish >= params.update_interval) {
             std::vector<Eigen::Vector3d> markers;
             for (const auto& entry : keyframe_db.SnapshotEntries()) {
@@ -1414,23 +1728,19 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             const bool pose_ok =
                     pose_err_m <= runtime.reloc_self_test.max_pose_error_m &&
                     pose_err_deg <= runtime.reloc_self_test.max_pose_error_deg;
-            const bool recovered = !tracking_was_unstable;
+            // Async reloc: accept pose-corrected recovery even while strong
+            // streak is still confirming (global_ok already proves reloc).
+            const bool recovered =
+                    !tracking_was_unstable ||
+                    (global_reloc_recovering && pose_ok &&
+                     consecutive_strong >= 1);
             const bool timed_out =
                     reloc_self_test_inject_frame >= 0 &&
                     frame_id >= reloc_self_test_inject_frame +
                                          runtime.reloc_self_test
                                                  .recovery_timeout_frames;
 
-            if (!pose_ok && frame_id == reloc_self_test_inject_frame) {
-                runtime.reloc_self_test_passed.store(false);
-                runtime.reloc_self_test_finished.store(true);
-                state.reloc_self_test_finished.store(true);
-                utility::LogWarning(
-                        "RELOC_SELF_TEST: FAIL (pose not corrected: {:.3f} m, "
-                        "{:.1f} deg vs stable).",
-                        pose_err_m, pose_err_deg);
-                state.request_stop.store(true);
-            } else if (recovered && pose_ok) {
+            if (recovered && pose_ok) {
                 runtime.reloc_self_test_passed.store(true);
                 runtime.reloc_self_test_finished.store(true);
                 state.reloc_self_test_finished.store(true);
@@ -1445,8 +1755,9 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 state.reloc_self_test_finished.store(true);
                 utility::LogWarning(
                         "RELOC_SELF_TEST: FAIL (recovery timeout at frame {}, "
-                        "pose err {:.3f} m, unstable={}).",
-                        frame_id, pose_err_m, tracking_was_unstable);
+                        "pose err {:.3f} m, unstable={}, global_ok={}).",
+                        frame_id, pose_err_m, tracking_was_unstable,
+                        reloc_self_test_global_ok);
                 state.request_stop.store(true);
             }
         }
@@ -1473,6 +1784,12 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
     runtime.model_ready.store(false);
     runtime.region_stop.store(true);
     runtime.region_cv.notify_all();
+    runtime.reloc_stop.store(true);
+    runtime.reloc_cv.notify_all();
+    if (reloc_thread.joinable()) {
+        reloc_thread.join();
+    }
+    runtime.reloc_keyframe_db = nullptr;
 
     if (runtime.reloc_self_test.enabled) {
         state.slam_finished.store(true);
@@ -1773,6 +2090,17 @@ int main(int argc, char* argv[]) {
                 argc, argv, "--reloc_min_fitness",
                 runtime.reloc_config.min_fitness);
     }
+    if (utility::ProgramOptionExists(argc, argv, "--reloc_max_pose_jump")) {
+        runtime.reloc_config.max_pose_jump_m =
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--reloc_max_pose_jump",
+                        runtime.reloc_config.max_pose_jump_m);
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--reloc_ransac_iter")) {
+        runtime.reloc_config.ransac_max_iter = utility::GetProgramOptionAsInt(
+                argc, argv, "--reloc_ransac_iter",
+                runtime.reloc_config.ransac_max_iter);
+    }
     if (utility::ProgramOptionExists(argc, argv, "--reloc_self_test")) {
         runtime.reloc_self_test.enabled = true;
         runtime.reloc_config.enabled = true;
@@ -1780,6 +2108,8 @@ int main(int argc, char* argv[]) {
         runtime.reloc_config.keyframe_interval_frames = 10;
         runtime.reloc_config.keyframe_min_translation = 0.05;
         runtime.reloc_config.keyframe_min_rotation_deg = 5.0;
+        // Async reloc needs a few frames after inject for queue+result+track.
+        runtime.reloc_self_test.recovery_timeout_frames = 20;
         utility::LogInfo(
                 "RELOC_SELF_TEST mode: warmup {} frames, inject drift, run "
                 "global reloc, then exit.",

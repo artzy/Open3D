@@ -933,17 +933,38 @@ protected:
             }
 
             try {
+                float downsample_voxel = static_cast<float>(
+                        prop_values_.voxel_size.load());
+                const int64_t before_down =
+                        segmentation_pcd.HasPointPositions()
+                                ? segmentation_pcd.GetPointPositions()
+                                          .GetLength()
+                                : 0;
                 segmentation_pcd = object_mesh::DownsamplePointCloudIfNeeded(
                         segmentation_pcd, kMaxSegmentationPoints,
-                        static_cast<float>(prop_values_.voxel_size.load()));
+                        downsample_voxel, &downsample_voxel);
 
                 if (region_settings_.enabled) {
                     object_mesh::SegmentationConfig config =
                             BuildRegionSegmentationConfig(extract_weight);
+                    config.dbscan_eps = std::max(
+                            config.dbscan_eps,
+                            4.0 * static_cast<double>(downsample_voxel));
                     config.camera_moved_since_last_check =
                             camera_moved_for_regions_ ||
                             !region_settings_.require_camera_motion;
                     freeze_tracker_.SetConfig(config);
+
+                    const int64_t after_down =
+                            segmentation_pcd.HasPointPositions()
+                                    ? segmentation_pcd.GetPointPositions()
+                                              .GetLength()
+                                    : 0;
+                    utility::LogInfo(
+                            "Region downsample: {} -> {} points "
+                            "(voxel={:.4f} m, dbscan_eps={:.4f} m).",
+                            before_down, after_down, downsample_voxel,
+                            config.dbscan_eps);
 
                     std::vector<object_mesh::FrozenObjectCandidate> ready;
                     ready = object_mesh::ProcessExtractedSurface(

@@ -39,14 +39,23 @@ struct RelocalizationConfig {
     double candidate_radius_m = 2.5;
     int retry_interval_frames = 15;
     std::string global_method = "ransac";
-    int ransac_max_iter = 100000;
+    /// Lower than classic Open3D default to keep reloc responsive on CPU.
+    int ransac_max_iter = 40000;
     double ransac_confidence = 0.999;
     double min_fitness = 0.25;
     double min_information_ratio = 0.20;
-    double max_pose_jump_m = 1.0;
+    /// Allow larger recovery walks while fitness/info gates block bad matches.
+    double max_pose_jump_m = 2.0;
+    /// Stop trying more keyframes once ICP fitness reaches this.
+    double early_exit_icp_fitness = 0.55;
     int verify_strong_streak = 3;
     int max_hypotheses = 3;
     bool show_keyframe_markers = false;
+};
+
+struct CandidateSelection {
+    std::vector<int> ids;
+    bool used_fallback = false;
 };
 
 inline RelocalizationConfig RelocalizationConfigForProfile(
@@ -334,19 +343,39 @@ public:
         return true;
     }
 
-    std::vector<int> SelectCandidates(
+    /// Prefer keyframes near query_position. If none are inside
+    /// candidate_radius_m, fall back to histogram-only ranking (no spatial cut).
+    CandidateSelection SelectCandidates(
             const Eigen::Vector3d& query_position,
             const std::vector<double>& live_histogram,
             const RelocalizationConfig& config) const {
         std::lock_guard<std::mutex> lock(mutex_);
         struct CandidateScore {
-            int id;
-            double spatial;
-            double appearance;
-            double combined;
+            int id = -1;
+            double spatial = 0.0;
+            double appearance = 0.0;
+            double combined = 0.0;
         };
-        std::vector<CandidateScore> scored;
-        scored.reserve(entries_.size());
+
+        auto rank_top = [&](const std::vector<CandidateScore>& scored)
+                -> std::vector<int> {
+            std::vector<CandidateScore> sorted = scored;
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const CandidateScore& a, const CandidateScore& b) {
+                          return a.combined < b.combined;
+                      });
+            std::vector<int> ids;
+            const int limit = std::min(config.max_candidates,
+                                       static_cast<int>(sorted.size()));
+            ids.reserve(limit);
+            for (int i = 0; i < limit; ++i) {
+                ids.push_back(sorted[i].id);
+            }
+            return ids;
+        };
+
+        std::vector<CandidateScore> in_radius;
+        in_radius.reserve(entries_.size());
         for (const auto& entry : entries_) {
             const double spatial =
                     (entry.capture_position - query_position).norm();
@@ -358,21 +387,33 @@ public:
                             ? 0.0
                             : HistogramL1Distance(live_histogram,
                                                   entry.depth_histogram);
-            scored.push_back({entry.id, spatial, appearance,
-                              spatial + 0.5 * appearance});
+            in_radius.push_back({entry.id, spatial, appearance,
+                                 spatial + 0.5 * appearance});
         }
-        std::sort(scored.begin(), scored.end(),
-                  [](const CandidateScore& a, const CandidateScore& b) {
-                      return a.combined < b.combined;
-                  });
-        std::vector<int> ids;
-        const int limit = std::min(config.max_candidates,
-                                   static_cast<int>(scored.size()));
-        ids.reserve(limit);
-        for (int i = 0; i < limit; ++i) {
-            ids.push_back(scored[i].id);
+
+        CandidateSelection selection;
+        if (!in_radius.empty()) {
+            selection.ids = rank_top(in_radius);
+            selection.used_fallback = false;
+            return selection;
         }
-        return ids;
+
+        // Fallback: ignore spatial radius; rank by depth-histogram distance.
+        std::vector<CandidateScore> all;
+        all.reserve(entries_.size());
+        for (const auto& entry : entries_) {
+            const double spatial =
+                    (entry.capture_position - query_position).norm();
+            const double appearance =
+                    live_histogram.empty()
+                            ? spatial
+                            : HistogramL1Distance(live_histogram,
+                                                  entry.depth_histogram);
+            all.push_back({entry.id, spatial, appearance, appearance});
+        }
+        selection.ids = rank_top(all);
+        selection.used_fallback = !selection.ids.empty();
+        return selection;
     }
 
 private:
@@ -447,13 +488,17 @@ inline RelocalizationAttempt TryRelocalizeAgainstKeyframe(
 
     core::Tensor init_T = core::eigen_converter::EigenMatrixToTensor(
             global_result.transformation_);
-    const double max_corr = config.downsample_voxel * 1.4;
-    const std::vector<double> voxel_sizes = {
-            static_cast<double>(config.downsample_voxel)};
+    const double voxel = static_cast<double>(config.downsample_voxel);
+    const double max_corr = voxel * 1.4;
+    // Coarse-to-fine improves convergence vs single-scale ICP.
+    const std::vector<double> voxel_sizes = {2.0 * voxel, voxel};
     const std::vector<t::pipelines::registration::ICPConvergenceCriteria>
-            criteria = {t::pipelines::registration::ICPConvergenceCriteria(
-                    1e-6, 1e-6, 30)};
-    const std::vector<double> max_dists = {max_corr};
+            criteria = {
+                    t::pipelines::registration::ICPConvergenceCriteria(1e-5,
+                                                                       1e-5, 20),
+                    t::pipelines::registration::ICPConvergenceCriteria(1e-6,
+                                                                       1e-6, 30)};
+    const std::vector<double> max_dists = {2.0 * max_corr, max_corr};
 
     auto icp_result = t::pipelines::registration::MultiScaleICP(
             pcd_live, keyframe.pcd_world, voxel_sizes, criteria, max_dists,
@@ -542,6 +587,10 @@ inline RelocalizationAttempt Relocalize(
         } else if (!best.accepted && !attempt.accepted &&
                    attempt.icp_fitness > best.icp_fitness) {
             best = attempt;
+        }
+        if (best.accepted &&
+            best.icp_fitness >= config.early_exit_icp_fitness) {
+            break;
         }
     }
     return best;

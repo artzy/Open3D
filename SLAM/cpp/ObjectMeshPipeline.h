@@ -2071,13 +2071,22 @@ inline std::vector<FrozenObjectCandidate> ProcessExtractedSurface(
 }
 
 inline t::geometry::PointCloud DownsamplePointCloudIfNeeded(
-        const t::geometry::PointCloud& pcd, int64_t max_points,
-        float voxel_size_hint = 0.0f) {
+        const t::geometry::PointCloud& pcd,
+        int64_t max_points,
+        float voxel_size_hint = 0.0f,
+        float* used_voxel_out = nullptr) {
+    if (used_voxel_out) {
+        *used_voxel_out = voxel_size_hint > 0.0f ? voxel_size_hint : 0.01f;
+    }
     if (!pcd.HasPointPositions()) {
         return pcd;
     }
     const int64_t count = pcd.GetPointPositions().GetLength();
     if (count <= max_points) {
+        if (used_voxel_out) {
+            *used_voxel_out =
+                    voxel_size_hint > 0.0f ? voxel_size_hint : 0.01f;
+        }
         return pcd;
     }
     // Voxel downsample is deterministic and keeps cluster signatures stable
@@ -2094,6 +2103,9 @@ inline t::geometry::PointCloud DownsamplePointCloudIfNeeded(
     if (down_count > max_points) {
         down = down.RandomDownSample(static_cast<double>(max_points) /
                                      static_cast<double>(down_count));
+    }
+    if (used_voxel_out) {
+        *used_voxel_out = voxel;
     }
     return down;
 }

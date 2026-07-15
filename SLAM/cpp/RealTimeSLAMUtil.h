@@ -91,6 +91,46 @@ public:
             return true;
         }
 
+        void SetCurrentCameraMarker(std::shared_ptr<geometry::LineSet> marker,
+                                    bool visible) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            current_camera_marker_ = std::move(marker);
+            current_camera_visible_ = visible;
+            has_current_camera_update_ = true;
+        }
+
+        bool TakeCurrentCameraMarker(std::shared_ptr<geometry::LineSet>& marker,
+                                     bool& visible) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!has_current_camera_update_) {
+                return false;
+            }
+            marker = current_camera_marker_;
+            visible = current_camera_visible_;
+            has_current_camera_update_ = false;
+            return true;
+        }
+
+        void SetRelocGuideLine(std::shared_ptr<geometry::LineSet> line,
+                               bool visible) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            reloc_guide_line_ = std::move(line);
+            reloc_guide_visible_ = visible;
+            has_reloc_guide_update_ = true;
+        }
+
+        bool TakeRelocGuideLine(std::shared_ptr<geometry::LineSet>& line,
+                                bool& visible) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!has_reloc_guide_update_) {
+                return false;
+            }
+            line = reloc_guide_line_;
+            visible = reloc_guide_visible_;
+            has_reloc_guide_update_ = false;
+            return true;
+        }
+
         void SetPoseDiffText(const std::string& text, bool visible) {
             std::lock_guard<std::mutex> lock(mutex_);
             pose_diff_text_ = text;
@@ -174,6 +214,12 @@ public:
         std::shared_ptr<geometry::LineSet> lost_camera_marker_;
         bool lost_camera_visible_ = false;
         bool has_lost_camera_update_ = false;
+        std::shared_ptr<geometry::LineSet> current_camera_marker_;
+        bool current_camera_visible_ = false;
+        bool has_current_camera_update_ = false;
+        std::shared_ptr<geometry::LineSet> reloc_guide_line_;
+        bool reloc_guide_visible_ = false;
+        bool has_reloc_guide_update_ = false;
         std::string pose_diff_text_;
         bool pose_diff_visible_ = false;
         bool has_pose_diff_update_ = false;
@@ -260,7 +306,7 @@ public:
         panel_->AddFixed(vspacing);
 
         keyframe_marker_toggle_ = std::make_shared<gui::ToggleSwitch>(
-                "Keyframe markers");
+                "Keyframe markers (debug)");
         keyframe_marker_toggle_->SetOn(false);
         keyframe_marker_toggle_->SetOnClicked([this](bool is_on) {
             state_.SetShowKeyframeMarkers(is_on);
@@ -318,6 +364,10 @@ private:
     t::geometry::PointCloud live_render_pcd_;
     geometry::LineSet lost_camera_marker_;
     bool lost_camera_marker_added_ = false;
+    geometry::LineSet current_camera_marker_;
+    bool current_camera_marker_added_ = false;
+    geometry::LineSet reloc_guide_line_;
+    bool reloc_guide_line_added_ = false;
     bool camera_view_initialized_ = false;
     std::string last_status_;
     std::vector<RegionSceneEntry> region_entries_;
@@ -538,6 +588,45 @@ private:
         lost_camera_marker_added_ = true;
     }
 
+    void UpdateCurrentCameraMarker(std::shared_ptr<geometry::LineSet> marker,
+                                   bool visible) {
+        using namespace rendering;
+        auto* scene = GetOpen3DScene();
+        if (current_camera_marker_added_ &&
+            scene->HasGeometry("current_camera")) {
+            scene->RemoveGeometry("current_camera");
+            current_camera_marker_added_ = false;
+        }
+        if (!visible || !marker || marker->IsEmpty()) {
+            return;
+        }
+        current_camera_marker_ = *marker;
+        MaterialRecord mat;
+        mat.shader = "unlitLine";
+        mat.line_width = 5.0f;
+        scene->AddGeometry("current_camera", &current_camera_marker_, mat);
+        current_camera_marker_added_ = true;
+    }
+
+    void UpdateRelocGuideLine(std::shared_ptr<geometry::LineSet> line,
+                              bool visible) {
+        using namespace rendering;
+        auto* scene = GetOpen3DScene();
+        if (reloc_guide_line_added_ && scene->HasGeometry("reloc_guide")) {
+            scene->RemoveGeometry("reloc_guide");
+            reloc_guide_line_added_ = false;
+        }
+        if (!visible || !line || line->IsEmpty()) {
+            return;
+        }
+        reloc_guide_line_ = *line;
+        MaterialRecord mat;
+        mat.shader = "unlitLine";
+        mat.line_width = 4.0f;
+        scene->AddGeometry("reloc_guide", &reloc_guide_line_, mat);
+        reloc_guide_line_added_ = true;
+    }
+
     void ApplyKeyframeMarkerVisibility() {
         auto* scene = GetOpen3DScene();
         const bool show = state_.ShowKeyframeMarkers();
@@ -601,6 +690,20 @@ private:
         if (state_.TakeLostCameraMarker(lost_camera_marker,
                                         lost_camera_visible)) {
             UpdateLostCameraMarker(lost_camera_marker, lost_camera_visible);
+        }
+
+        std::shared_ptr<geometry::LineSet> current_camera_marker;
+        bool current_camera_visible = false;
+        if (state_.TakeCurrentCameraMarker(current_camera_marker,
+                                           current_camera_visible)) {
+            UpdateCurrentCameraMarker(current_camera_marker,
+                                      current_camera_visible);
+        }
+
+        std::shared_ptr<geometry::LineSet> reloc_guide;
+        bool reloc_guide_visible = false;
+        if (state_.TakeRelocGuideLine(reloc_guide, reloc_guide_visible)) {
+            UpdateRelocGuideLine(reloc_guide, reloc_guide_visible);
         }
 
         std::string pose_diff_text;
