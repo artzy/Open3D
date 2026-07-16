@@ -287,6 +287,17 @@ public:
         return entries_;
     }
 
+    /// Most recently added keyframes (newest last), up to \p count.
+    std::vector<KeyframeEntry> SnapshotRecentEntries(int count) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (count <= 0 || entries_.empty()) {
+            return {};
+        }
+        const int n = static_cast<int>(entries_.size());
+        const int take = std::min(count, n);
+        return std::vector<KeyframeEntry>(entries_.end() - take, entries_.end());
+    }
+
     bool MaybeAddKeyframe(const t::geometry::RGBDImage& rgbd,
                           const core::Tensor& intrinsic,
                           const core::Tensor& T_world,
@@ -459,6 +470,119 @@ inline pipelines::registration::RegistrationResult RunGlobalRegistration(
             3, checkers,
             pipelines::registration::RANSACConvergenceCriteria(
                     config.ransac_max_iter, config.ransac_confidence));
+}
+
+/// Local ICP against a keyframe without global RANSAC/FPFH (close-range recovery).
+inline RelocalizationAttempt TryLocalRelocalizeAgainstKeyframe(
+        const t::geometry::PointCloud& pcd_live,
+        const KeyframeEntry& keyframe,
+        const core::Tensor& init_T_live_to_world,
+        const core::Tensor& last_stable_T,
+        const RelocalizationConfig& config,
+        double min_fitness = 0.35,
+        double max_pose_jump_m = 0.30,
+        double max_rotation_jump_deg = 15.0) {
+    RelocalizationAttempt attempt;
+    attempt.keyframe_id = keyframe.id;
+    if (!pcd_live.HasPointPositions() ||
+        !keyframe.pcd_world.HasPointPositions()) {
+        attempt.reject_reason = "empty point cloud";
+        return attempt;
+    }
+    if (init_T_live_to_world.NumElements() == 0) {
+        attempt.reject_reason = "empty init pose";
+        return attempt;
+    }
+
+    const double voxel = static_cast<double>(config.downsample_voxel);
+    const double max_corr = voxel * 1.4;
+    const std::vector<double> voxel_sizes = {2.0 * voxel, voxel};
+    const std::vector<t::pipelines::registration::ICPConvergenceCriteria>
+            criteria = {
+                    t::pipelines::registration::ICPConvergenceCriteria(1e-5,
+                                                                       1e-5, 20),
+                    t::pipelines::registration::ICPConvergenceCriteria(1e-6,
+                                                                       1e-6, 30)};
+    const std::vector<double> max_dists = {2.0 * max_corr, max_corr};
+
+    auto icp_result = t::pipelines::registration::MultiScaleICP(
+            pcd_live, keyframe.pcd_world, voxel_sizes, criteria, max_dists,
+            init_T_live_to_world.Contiguous(),
+            t::pipelines::registration::TransformationEstimationPointToPlane());
+    attempt.icp_fitness = icp_result.fitness_;
+    attempt.T_live_to_world = icp_result.transformation_.Contiguous();
+    attempt.global_fitness = attempt.icp_fitness;
+
+    if (attempt.icp_fitness < min_fitness) {
+        attempt.reject_reason = "low local icp fitness";
+        return attempt;
+    }
+
+    const double pose_jump =
+            TranslationDistance(attempt.T_live_to_world, last_stable_T);
+    if (pose_jump > max_pose_jump_m) {
+        attempt.reject_reason = "local pose jump too large";
+        return attempt;
+    }
+    const core::Tensor relative =
+            last_stable_T.Inverse().Matmul(attempt.T_live_to_world);
+    if (PoseRotationAngleDeg(relative) > max_rotation_jump_deg) {
+        attempt.reject_reason = "local rotation jump too large";
+        return attempt;
+    }
+
+    auto eval = t::pipelines::registration::EvaluateRegistration(
+            pcd_live, keyframe.pcd_world, max_corr, attempt.T_live_to_world);
+    if (eval.fitness_ < min_fitness * 0.85) {
+        attempt.reject_reason = "low local eval fitness";
+        return attempt;
+    }
+    attempt.information_ratio = eval.fitness_;
+    attempt.accepted = true;
+    return attempt;
+}
+
+inline RelocalizationAttempt RelocalizeLocal(
+        const t::geometry::RGBDImage& live_rgbd,
+        const core::Tensor& intrinsic,
+        const KeyframeDatabase& db,
+        const std::vector<int>& candidate_ids,
+        const core::Tensor& init_T_live_to_world,
+        const core::Tensor& last_stable_T,
+        float depth_scale,
+        float depth_max,
+        const RelocalizationConfig& config,
+        const core::Device& device) {
+    RelocalizationAttempt best;
+    if (candidate_ids.empty()) {
+        best.reject_reason = "no local candidates";
+        return best;
+    }
+    t::geometry::PointCloud pcd_live = PreprocessLivePointCloud(
+            live_rgbd, intrinsic, depth_scale, depth_max, device, config);
+    if (!pcd_live.HasPointPositions()) {
+        best.reject_reason = "empty live cloud";
+        return best;
+    }
+    for (int candidate_id : candidate_ids) {
+        const KeyframeEntry* keyframe = db.GetEntry(candidate_id);
+        if (keyframe == nullptr) {
+            continue;
+        }
+        RelocalizationAttempt attempt = TryLocalRelocalizeAgainstKeyframe(
+                pcd_live, *keyframe, init_T_live_to_world, last_stable_T,
+                config);
+        if (attempt.accepted && attempt.icp_fitness > best.icp_fitness) {
+            best = attempt;
+        } else if (!best.accepted && !attempt.accepted &&
+                   attempt.icp_fitness > best.icp_fitness) {
+            best = attempt;
+        }
+        if (best.accepted && best.icp_fitness >= 0.55) {
+            break;
+        }
+    }
+    return best;
 }
 
 inline RelocalizationAttempt TryRelocalizeAgainstKeyframe(

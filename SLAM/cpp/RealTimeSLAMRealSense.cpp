@@ -32,6 +32,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "ObjectMeshPipeline.h"
 #include "RealTimeSLAMUtil.h"
@@ -62,6 +63,21 @@ namespace realtime_slam = open3d::examples::realtime_slam;
 namespace relocalization = open3d::examples::relocalization;
 using DisplayState = realtime_slam::RealTimeSLAMWindow::DisplayState;
 
+struct CloseTrackingGuardParams {
+    bool enabled = true;
+    float close_depth_m = 0.45f;
+    float close_near_ratio = 0.55f;
+    float close_median_m = 0.40f;
+    float critical_valid_ratio = 0.25f;
+    float critical_median_m = 0.20f;
+    int hysteresis_frames = 3;
+    int strong_frames_to_resume_integrate = 5;
+    int local_icp_rate_limit_frames = 10;
+    int local_icp_after_weak_frames = 2;
+    float predict_max_translation_m = 0.08f;
+    float predict_max_rotation_deg = 8.f;
+};
+
 struct SlamParams {
     float voxel_size = 3.f / 512.f;
     float trunc_multiplier = 8.f;
@@ -75,6 +91,7 @@ struct SlamParams {
     int odom_iter_mid = 3;
     int odom_iter_fine = 2;
     object_mesh::RegionParams regions;
+    CloseTrackingGuardParams close_guard;
 };
 
 SlamParams GetProfile(const std::string& profile) {
@@ -169,6 +186,13 @@ void PrintHelp() {
     utility::LogInfo("    [--reloc_max_pose_jump M] Max jump vs last_stable (m, default: 2.0).");
     utility::LogInfo("    [--reloc_ransac_iter N]   RANSAC max iterations (default: 40000).");
     utility::LogInfo("    [--reloc_self_test]       Auto lost/global-reloc self test (exits).");
+    utility::LogInfo("");
+    utility::LogInfo("Close-range tracking guard:");
+    utility::LogInfo("    [--no_close_tracking_guard] Disable close-risk hold/Hybrid/local ICP.");
+    utility::LogInfo("    [--close_depth M]        Near-depth threshold meters (default: 0.45).");
+    utility::LogInfo("    [--close_near_ratio R]   Near-pixel ratio for close risk (default: 0.55).");
+    utility::LogInfo("    [--close_min_valid_ratio R] Critical valid-depth ratio (default: 0.25).");
+    utility::LogInfo("    [--close_tracking_self_test] Pure helper self-test (no camera, exits).");
     utility::LogInfo("");
     utility::LogInfo("GUI controls (left panel):");
     utility::LogInfo("    Cloud capture ON/OFF    Pause/resume RGB-D capture and SLAM integration.");
@@ -324,6 +348,368 @@ bool IsFrameToFrameBridgeStable(double fitness,
     return fitness >= kF2FBridgeFitnessMin &&
            translation < kF2FBridgeTranslationMax &&
            rotation_deg < kF2FBridgeRotationMaxDeg;
+}
+
+struct DepthQualityMetrics {
+    double valid_ratio = 0.0;
+    double near_ratio = 0.0;
+    double median_depth = 0.0;
+    int64_t sampled = 0;
+    int64_t valid = 0;
+};
+
+struct DepthQualityFlags {
+    bool close_risk = false;
+    bool critical = false;
+};
+
+DepthQualityMetrics ComputeDepthQualityMetrics(
+        const t::geometry::RGBDImage& rgbd,
+        float depth_scale,
+        float depth_max,
+        float near_depth_m,
+        int stride = 4) {
+    DepthQualityMetrics metrics;
+    if (rgbd.depth_.IsEmpty() || stride < 1) {
+        return metrics;
+    }
+    t::geometry::Image depth = rgbd.depth_.To(core::Device("CPU:0"));
+    core::Tensor depth_tensor = depth.AsTensor().Contiguous();
+    const int64_t rows = depth.GetRows();
+    const int64_t cols = depth.GetCols();
+    if (rows <= 0 || cols <= 0) {
+        return metrics;
+    }
+
+    std::vector<float> valid_depths;
+    valid_depths.reserve(static_cast<size_t>((rows / stride + 1) *
+                                             (cols / stride + 1)));
+
+    auto consider = [&](double raw) {
+        ++metrics.sampled;
+        const double meters = raw / static_cast<double>(depth_scale);
+        if (meters <= 0.0 || meters > static_cast<double>(depth_max)) {
+            return;
+        }
+        ++metrics.valid;
+        valid_depths.push_back(static_cast<float>(meters));
+    };
+
+    if (depth_tensor.GetDtype() == core::UInt16) {
+        const uint16_t* data = depth_tensor.GetDataPtr<uint16_t>();
+        for (int64_t r = 0; r < rows; r += stride) {
+            for (int64_t c = 0; c < cols; c += stride) {
+                consider(static_cast<double>(data[r * cols + c]));
+            }
+        }
+    } else if (depth_tensor.GetDtype() == core::Float32) {
+        const float* data = depth_tensor.GetDataPtr<float>();
+        for (int64_t r = 0; r < rows; r += stride) {
+            for (int64_t c = 0; c < cols; c += stride) {
+                consider(static_cast<double>(data[r * cols + c]));
+            }
+        }
+    } else {
+        core::Tensor depth_f64 = depth_tensor.To(core::Dtype::Float64);
+        const double* data = depth_f64.GetDataPtr<double>();
+        for (int64_t r = 0; r < rows; r += stride) {
+            for (int64_t c = 0; c < cols; c += stride) {
+                consider(data[r * cols + c]);
+            }
+        }
+    }
+
+    if (metrics.sampled > 0) {
+        metrics.valid_ratio =
+                static_cast<double>(metrics.valid) /
+                static_cast<double>(metrics.sampled);
+    }
+    if (!valid_depths.empty()) {
+        int64_t near_count = 0;
+        for (float d : valid_depths) {
+            if (d < near_depth_m) {
+                ++near_count;
+            }
+        }
+        metrics.near_ratio = static_cast<double>(near_count) /
+                             static_cast<double>(valid_depths.size());
+        const size_t mid = valid_depths.size() / 2;
+        std::nth_element(valid_depths.begin(), valid_depths.begin() + mid,
+                         valid_depths.end());
+        metrics.median_depth = valid_depths[mid];
+    }
+    return metrics;
+}
+
+DepthQualityFlags ClassifyDepthQuality(
+        const DepthQualityMetrics& metrics,
+        const CloseTrackingGuardParams& guard) {
+    DepthQualityFlags flags;
+    flags.close_risk = metrics.near_ratio >= guard.close_near_ratio ||
+                       metrics.median_depth < guard.close_median_m;
+    flags.critical = metrics.valid_ratio < guard.critical_valid_ratio ||
+                     metrics.median_depth < guard.critical_median_m;
+    return flags;
+}
+
+/// 3-frame hysteresis to avoid warning flicker on borderline frames.
+class DepthQualityHysteresis {
+public:
+    explicit DepthQualityHysteresis(int hold_frames = 3)
+        : hold_frames_(std::max(1, hold_frames)) {}
+
+    DepthQualityFlags Update(const DepthQualityFlags& instant) {
+        if (instant.critical) {
+            critical_streak_ = hold_frames_;
+        } else if (critical_streak_ > 0) {
+            --critical_streak_;
+        }
+        if (instant.close_risk || instant.critical) {
+            close_streak_ = hold_frames_;
+        } else if (close_streak_ > 0) {
+            --close_streak_;
+        }
+        DepthQualityFlags out;
+        out.critical = critical_streak_ > 0;
+        out.close_risk = close_streak_ > 0;
+        return out;
+    }
+
+private:
+    int hold_frames_ = 3;
+    int critical_streak_ = 0;
+    int close_streak_ = 0;
+};
+
+core::Tensor ClampRelativePose(const core::Tensor& delta,
+                               double max_translation_m,
+                               double max_rotation_deg) {
+    Eigen::Matrix4d mat =
+            core::eigen_converter::TensorToEigenMatrixXd(delta);
+    Eigen::Vector3d t = mat.block<3, 1>(0, 3);
+    const double t_norm = t.norm();
+    if (t_norm > max_translation_m && t_norm > 1e-12) {
+        t *= max_translation_m / t_norm;
+        mat.block<3, 1>(0, 3) = t;
+    }
+    Eigen::Matrix3d R = mat.block<3, 3>(0, 0);
+    Eigen::AngleAxisd aa(R);
+    double angle_deg = std::abs(aa.angle()) * 180.0 / 3.14159265358979323846;
+    if (angle_deg > max_rotation_deg && aa.angle() != 0.0) {
+        const double scale = max_rotation_deg / angle_deg;
+        aa.angle() *= scale;
+        mat.block<3, 3>(0, 0) = aa.toRotationMatrix();
+    }
+    return core::eigen_converter::EigenMatrixToTensor(mat);
+}
+
+/// Constant-velocity seed from the last two strong poses, with delta clamps.
+bool PredictPoseFromVelocity(const core::Tensor& prev_strong,
+                             const core::Tensor& last_strong,
+                             double max_translation_m,
+                             double max_rotation_deg,
+                             core::Tensor& predicted_out) {
+    if (prev_strong.NumElements() == 0 || last_strong.NumElements() == 0) {
+        return false;
+    }
+    const core::Tensor delta =
+            prev_strong.Inverse().Matmul(last_strong).Contiguous();
+    const core::Tensor clamped =
+            ClampRelativePose(delta, max_translation_m, max_rotation_deg);
+    predicted_out = last_strong.Matmul(clamped).Contiguous();
+    return true;
+}
+
+struct SeedProbeCandidate {
+    std::string label;
+    core::Tensor seed_T;
+    double fitness = 0.0;
+    double score = -1.0;
+    TrackingTier tier = TrackingTier::kFail;
+    core::Tensor delta_T;
+    t::pipelines::odometry::Method method =
+            t::pipelines::odometry::Method::PointToPlane;
+};
+
+int TierRank(TrackingTier tier) {
+    switch (tier) {
+        case TrackingTier::kStrong:
+            return 3;
+        case TrackingTier::kWeak:
+            return 2;
+        case TrackingTier::kFail:
+            return 1;
+        case TrackingTier::kOutlier:
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+/// Prefer higher tracking tier, then MultiHypothesis-style score.
+bool IsBetterSeedCandidate(const SeedProbeCandidate& a,
+                           const SeedProbeCandidate& b) {
+    const int ra = TierRank(a.tier);
+    const int rb = TierRank(b.tier);
+    if (ra != rb) {
+        return ra > rb;
+    }
+    return a.score > b.score;
+}
+
+struct CloseTrackingCounters {
+    int close_risk = 0;
+    int quality_hold = 0;
+    int hybrid_win = 0;
+    int predicted_win = 0;
+    int proactive_f2f = 0;
+    int local_kf_accept = 0;
+    int global_reloc = 0;
+};
+
+bool RunCloseTrackingSelfTest() {
+    utility::LogInfo("CLOSE_TRACKING_SELF_TEST: start");
+    bool ok = true;
+
+    // Synthetic UInt16 depth: ~62% near (0.30 m), rest mid (0.80 m).
+    {
+        const int rows = 8;
+        const int cols = 8;
+        const float depth_scale = 1000.f;
+        std::vector<uint16_t> data(static_cast<size_t>(rows * cols), 800);
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                if (r * cols + c < 40) {
+                    data[static_cast<size_t>(r * cols + c)] = 300;
+                }
+            }
+        }
+        core::Tensor depth_t(data, {rows, cols, 1}, core::UInt16);
+        t::geometry::Image depth_img(depth_t);
+        t::geometry::Image color_img(
+                core::Tensor::Zeros({rows, cols, 3}, core::UInt8));
+        t::geometry::RGBDImage rgbd(color_img, depth_img);
+        CloseTrackingGuardParams guard;
+        auto metrics = ComputeDepthQualityMetrics(rgbd, depth_scale, 3.f,
+                                                  guard.close_depth_m, 1);
+        auto flags = ClassifyDepthQuality(metrics, guard);
+        if (metrics.valid_ratio < 0.99 || metrics.near_ratio < 0.55 ||
+            metrics.near_ratio > 0.70 || metrics.median_depth > 0.45 ||
+            !flags.close_risk || flags.critical) {
+            utility::LogWarning(
+                    "CLOSE_TRACKING_SELF_TEST FAIL: UInt16 metrics "
+                    "valid={:.3f} near={:.3f} median={:.3f} close={} crit={}",
+                    metrics.valid_ratio, metrics.near_ratio,
+                    metrics.median_depth, flags.close_risk, flags.critical);
+            ok = false;
+        }
+    }
+
+    // Float32 mostly invalid -> critical.
+    {
+        const int rows = 4;
+        const int cols = 4;
+        std::vector<float> data(static_cast<size_t>(rows * cols), 0.f);
+        data[0] = 0.15f;
+        core::Tensor depth_t(data, {rows, cols, 1}, core::Float32);
+        t::geometry::Image depth_img(depth_t);
+        t::geometry::Image color_img(
+                core::Tensor::Zeros({rows, cols, 3}, core::UInt8));
+        t::geometry::RGBDImage rgbd(color_img, depth_img);
+        CloseTrackingGuardParams guard;
+        auto metrics =
+                ComputeDepthQualityMetrics(rgbd, 1.f, 3.f, guard.close_depth_m, 1);
+        auto flags = ClassifyDepthQuality(metrics, guard);
+        if (metrics.valid_ratio > 0.2 || !flags.critical) {
+            utility::LogWarning(
+                    "CLOSE_TRACKING_SELF_TEST FAIL: Float32 critical "
+                    "valid={:.3f} crit={}",
+                    metrics.valid_ratio, flags.critical);
+            ok = false;
+        }
+    }
+
+    // Hysteresis: one critical pulse stays for hold_frames.
+    {
+        DepthQualityHysteresis hyst(3);
+        DepthQualityFlags pulse;
+        pulse.critical = true;
+        pulse.close_risk = true;
+        auto held = hyst.Update(pulse);
+        if (!held.critical) {
+            utility::LogWarning(
+                    "CLOSE_TRACKING_SELF_TEST FAIL: hysteresis enter");
+            ok = false;
+        }
+        DepthQualityFlags clear;
+        for (int i = 0; i < 2; ++i) {
+            held = hyst.Update(clear);
+        }
+        if (!held.critical) {
+            utility::LogWarning(
+                    "CLOSE_TRACKING_SELF_TEST FAIL: hysteresis hold");
+            ok = false;
+        }
+        held = hyst.Update(clear);
+        if (held.critical) {
+            utility::LogWarning(
+                    "CLOSE_TRACKING_SELF_TEST FAIL: hysteresis release");
+            ok = false;
+        }
+    }
+
+    // Pose predictor + clamp.
+    {
+        core::Tensor prev =
+                core::Tensor::Eye(4, core::Dtype::Float64, core::Device("CPU:0"));
+        Eigen::Matrix4d last_e = Eigen::Matrix4d::Identity();
+        last_e(0, 3) = 0.20;  // large step -> clamp to 0.08
+        core::Tensor last =
+                core::eigen_converter::EigenMatrixToTensor(last_e);
+        core::Tensor predicted;
+        if (!PredictPoseFromVelocity(prev, last, 0.08, 8.0, predicted)) {
+            utility::LogWarning(
+                    "CLOSE_TRACKING_SELF_TEST FAIL: predict returned false");
+            ok = false;
+        } else {
+            const double jump =
+                    relocalization::TranslationDistance(predicted, last);
+            if (std::abs(jump - 0.08) > 1e-3) {
+                utility::LogWarning(
+                        "CLOSE_TRACKING_SELF_TEST FAIL: predict clamp "
+                        "jump={:.4f}",
+                        jump);
+                ok = false;
+            }
+        }
+    }
+
+    // Candidate selection rejects outlier vs strong.
+    {
+        SeedProbeCandidate strong;
+        strong.label = "predicted";
+        strong.tier = TrackingTier::kStrong;
+        strong.score = 0.10;
+        strong.fitness = 0.20;
+        SeedProbeCandidate outlier;
+        outlier.label = "current";
+        outlier.tier = TrackingTier::kOutlier;
+        outlier.score = 0.90;
+        outlier.fitness = 0.90;
+        if (!IsBetterSeedCandidate(strong, outlier) ||
+            IsBetterSeedCandidate(outlier, strong)) {
+            utility::LogWarning(
+                    "CLOSE_TRACKING_SELF_TEST FAIL: tier selection");
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        utility::LogInfo("CLOSE_TRACKING_SELF_TEST: PASS");
+    } else {
+        utility::LogWarning("CLOSE_TRACKING_SELF_TEST: FAIL");
+    }
+    return ok;
 }
 
 std::shared_ptr<geometry::LineSet> CreateCameraMarker(
@@ -537,7 +923,8 @@ struct SlamRuntime {
 
     relocalization::RelocalizationConfig reloc_config;
 
-    // Async global relocalization (does not block the SLAM integrate loop).
+    // Async global / local-keyframe relocalization (does not block SLAM).
+    enum class RelocRequestMode { kGlobal = 0, kLocalIcp = 1 };
     std::mutex reloc_mutex;
     std::condition_variable reloc_cv;
     std::atomic<bool> reloc_requested{false};
@@ -547,7 +934,9 @@ struct SlamRuntime {
     t::geometry::RGBDImage pending_reloc_rgbd;
     core::Tensor pending_reloc_intrinsic;
     core::Tensor pending_reloc_last_stable;
+    core::Tensor pending_reloc_init_pose;
     std::vector<int> pending_reloc_candidate_ids;
+    RelocRequestMode pending_reloc_mode = RelocRequestMode::kGlobal;
     int pending_reloc_frame_id = 0;
     int pending_reloc_request_id = 0;
     float pending_reloc_depth_scale = 1000.f;
@@ -555,6 +944,7 @@ struct SlamRuntime {
     bool pending_reloc_used_fallback = false;
     int next_reloc_request_id = 1;
     relocalization::RelocalizationAttempt reloc_result;
+    RelocRequestMode reloc_result_mode = RelocRequestMode::kGlobal;
     int reloc_result_frame_id = 0;
     int reloc_result_request_id = 0;
     double reloc_result_elapsed_ms = 0.0;
@@ -779,13 +1169,16 @@ void RegionWorker(SlamRuntime& runtime,
     }
 }
 
-/// Runs global relocalization off the SLAM thread so tracking stays responsive.
+/// Runs global / local-keyframe relocalization off the SLAM thread.
 void RelocWorker(SlamRuntime& runtime) {
     while (true) {
         t::geometry::RGBDImage rgbd;
         core::Tensor intrinsic;
         core::Tensor last_stable;
+        core::Tensor init_pose;
         std::vector<int> candidate_ids;
+        SlamRuntime::RelocRequestMode mode =
+                SlamRuntime::RelocRequestMode::kGlobal;
         int frame_id = 0;
         int request_id = 0;
         float depth_scale = 1000.f;
@@ -804,7 +1197,9 @@ void RelocWorker(SlamRuntime& runtime) {
             rgbd = runtime.pending_reloc_rgbd;
             intrinsic = runtime.pending_reloc_intrinsic;
             last_stable = runtime.pending_reloc_last_stable;
+            init_pose = runtime.pending_reloc_init_pose;
             candidate_ids = runtime.pending_reloc_candidate_ids;
+            mode = runtime.pending_reloc_mode;
             frame_id = runtime.pending_reloc_frame_id;
             request_id = runtime.pending_reloc_request_id;
             depth_scale = runtime.pending_reloc_depth_scale;
@@ -820,16 +1215,29 @@ void RelocWorker(SlamRuntime& runtime) {
         const auto t0 = std::chrono::steady_clock::now();
         relocalization::RelocalizationAttempt attempt;
         try {
-            attempt = relocalization::Relocalize(
-                    rgbd, intrinsic, *runtime.reloc_keyframe_db, candidate_ids,
-                    last_stable, depth_scale, depth_max, runtime.reloc_config,
-                    runtime.reloc_device);
+            if (mode == SlamRuntime::RelocRequestMode::kLocalIcp) {
+                if (init_pose.NumElements() == 0) {
+                    init_pose = last_stable;
+                }
+                attempt = relocalization::RelocalizeLocal(
+                        rgbd, intrinsic, *runtime.reloc_keyframe_db,
+                        candidate_ids, init_pose, last_stable, depth_scale,
+                        depth_max, runtime.reloc_config, runtime.reloc_device);
+            } else {
+                attempt = relocalization::Relocalize(
+                        rgbd, intrinsic, *runtime.reloc_keyframe_db,
+                        candidate_ids, last_stable, depth_scale, depth_max,
+                        runtime.reloc_config, runtime.reloc_device);
+            }
         } catch (const std::exception& e) {
             attempt = {};
             attempt.accepted = false;
             attempt.reject_reason = std::string("exception: ") + e.what();
-            utility::LogWarning("Global relocalization threw at frame {}: {}",
-                                frame_id, e.what());
+            utility::LogWarning(
+                    "{} relocalization threw at frame {}: {}",
+                    mode == SlamRuntime::RelocRequestMode::kLocalIcp ? "Local"
+                                                                     : "Global",
+                    frame_id, e.what());
         }
         const double elapsed_ms =
                 std::chrono::duration<double, std::milli>(
@@ -839,6 +1247,7 @@ void RelocWorker(SlamRuntime& runtime) {
         {
             std::lock_guard<std::mutex> lock(runtime.reloc_mutex);
             runtime.reloc_result = attempt;
+            runtime.reloc_result_mode = mode;
             runtime.reloc_result_frame_id = frame_id;
             runtime.reloc_result_request_id = request_id;
             runtime.reloc_result_elapsed_ms = elapsed_ms;
@@ -849,18 +1258,21 @@ void RelocWorker(SlamRuntime& runtime) {
         }
         runtime.reloc_worker_busy.store(false);
 
+        const char* mode_name =
+                mode == SlamRuntime::RelocRequestMode::kLocalIcp ? "Local ICP"
+                                                                : "Global";
         if (attempt.accepted) {
             utility::LogInfo(
-                    "Global reloc finished in {:.0f} ms (frame {}, KF#{}, "
+                    "{} reloc finished in {:.0f} ms (frame {}, KF#{}, "
                     "fitness {:.3f}, candidates {}, fallback={}).",
-                    elapsed_ms, frame_id, attempt.keyframe_id,
+                    mode_name, elapsed_ms, frame_id, attempt.keyframe_id,
                     attempt.icp_fitness, candidate_ids.size(),
                     used_fallback ? 1 : 0);
         } else {
             utility::LogWarning(
-                    "Global reloc finished in {:.0f} ms (frame {}, rejected: "
+                    "{} reloc finished in {:.0f} ms (frame {}, rejected: "
                     "{}, candidates {}, fallback={}).",
-                    elapsed_ms, frame_id,
+                    mode_name, elapsed_ms, frame_id,
                     attempt.reject_reason.empty() ? "unknown"
                                                   : attempt.reject_reason,
                     candidate_ids.size(), used_fallback ? 1 : 0);
@@ -1029,6 +1441,35 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
     bool reloc_self_test_global_ok = false;
     int reloc_self_test_inject_frame = -1;
 
+    DepthQualityHysteresis depth_hysteresis(
+            params.close_guard.hysteresis_frames);
+    CloseTrackingCounters close_counters;
+    DepthQualityMetrics last_depth_metrics;
+    bool quality_hold_active = false;
+    bool quality_hold_recovering = false;
+    int quality_hold_strong_streak = 0;
+    int consecutive_close_weak = 0;
+    int last_local_icp_frame = -1000;
+    bool have_prev_strong_pose = false;
+    core::Tensor prev_strong_T_frame_to_model =
+            T_frame_to_model.Contiguous();
+    core::Tensor last_strong_T_frame_to_model =
+            T_frame_to_model.Contiguous();
+    if (params.close_guard.enabled) {
+        // Allow current / predicted / f2f / local / global seeds.
+        runtime.reloc_config.max_hypotheses =
+                std::max(runtime.reloc_config.max_hypotheses, 5);
+        hypothesis_tracker = relocalization::MultiHypothesisTracker(
+                runtime.reloc_config);
+        utility::LogInfo(
+                "Close-tracking guard ON (near<{:.2f}m ratio>={:.2f}, "
+                "critical valid<{:.2f} or median<{:.2f}m).",
+                params.close_guard.close_depth_m,
+                params.close_guard.close_near_ratio,
+                params.close_guard.critical_valid_ratio,
+                params.close_guard.critical_median_m);
+    }
+
     int frame_id = 0;
     while (!state.request_stop.load()) {
         if (!state.capture_enabled.load()) {
@@ -1056,6 +1497,77 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             continue;
         }
         empty_capture_retries = 0;
+
+        DepthQualityFlags depth_flags;
+        if (params.close_guard.enabled) {
+            last_depth_metrics = ComputeDepthQualityMetrics(
+                    rgbd, params.depth_scale, params.depth_max,
+                    params.close_guard.close_depth_m, 4);
+            const DepthQualityFlags instant = ClassifyDepthQuality(
+                    last_depth_metrics, params.close_guard);
+            depth_flags = depth_hysteresis.Update(instant);
+            if (depth_flags.close_risk) {
+                ++close_counters.close_risk;
+            }
+        }
+
+        // Critical depth: hold last stable pose, never integrate junk, and do
+        // not inflate lost / global-reloc failure streaks.
+        if (params.close_guard.enabled && depth_flags.critical) {
+            ++close_counters.quality_hold;
+            quality_hold_active = true;
+            quality_hold_recovering = true;
+            quality_hold_strong_streak = 0;
+            T_frame_to_model = last_stable_T_frame_to_model.Contiguous();
+            {
+                std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
+                try {
+                    rgbd = rgbd.To(device);
+                    input_frame.SetDataFromImage("depth", rgbd.depth_);
+                    input_frame.SetDataFromImage("color", rgbd.color_);
+                    model.UpdateFramePose(frame_id, T_frame_to_model);
+                    model.SynthesizeModelFrame(
+                            raycast_frame, params.depth_scale, 0.1f,
+                            params.depth_max, params.trunc_multiplier, false);
+                } catch (const std::exception& e) {
+                    utility::LogWarning(
+                            "Quality-hold raycast failed at frame {}: {}",
+                            frame_id, e.what());
+                }
+            }
+            {
+                std::ostringstream oss;
+                oss << "TOO CLOSE | back up | valid=" << std::fixed
+                    << std::setprecision(2) << last_depth_metrics.valid_ratio
+                    << " near=" << last_depth_metrics.near_ratio
+                    << " median=" << last_depth_metrics.median_depth << "m"
+                    << " | Frame " << frame_id;
+                state.SetStatus(oss.str());
+            }
+            if (frame_id % 30 == 0) {
+                utility::LogWarning(
+                        "Depth quality hold frame {} (valid={:.2f}, "
+                        "near={:.2f}, median={:.2f} m) — pose frozen.",
+                        frame_id, last_depth_metrics.valid_ratio,
+                        last_depth_metrics.near_ratio,
+                        last_depth_metrics.median_depth);
+            }
+            prev_rgbd = rgbd;
+            ++frame_id;
+            continue;
+        }
+        if (quality_hold_active && !depth_flags.critical) {
+            quality_hold_active = false;
+            quality_hold_recovering = true;
+            quality_hold_strong_streak = 0;
+            // First healthy frame after critical enters close-risk recovery.
+            depth_flags.close_risk = true;
+            utility::LogInfo(
+                    "Depth quality recovered at frame {} — waiting for {} "
+                    "strong frames before integration.",
+                    frame_id,
+                    params.close_guard.strong_frames_to_resume_integrate);
+        }
 
         rgbd = rgbd.To(device);
         input_frame.SetDataFromImage("depth", rgbd.depth_);
@@ -1104,6 +1616,8 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         // Apply finished async reloc results first (stale-safe via request id).
         if (runtime.reloc_config.enabled && runtime.reloc_result_ready.load()) {
             relocalization::RelocalizationAttempt attempt;
+            SlamRuntime::RelocRequestMode result_mode =
+                    SlamRuntime::RelocRequestMode::kGlobal;
             int result_frame = 0;
             int result_request = 0;
             double elapsed_ms = 0.0;
@@ -1113,6 +1627,7 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 std::lock_guard<std::mutex> lock(runtime.reloc_mutex);
                 if (runtime.reloc_result_ready.load()) {
                     attempt = runtime.reloc_result;
+                    result_mode = runtime.reloc_result_mode;
                     result_frame = runtime.reloc_result_frame_id;
                     result_request = runtime.reloc_result_request_id;
                     elapsed_ms = runtime.reloc_result_elapsed_ms;
@@ -1129,22 +1644,39 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 last_reloc_candidate_count = candidate_count;
 
                 if (attempt.accepted) {
+                    const bool is_local =
+                            result_mode ==
+                            SlamRuntime::RelocRequestMode::kLocalIcp;
+                    const double max_jump =
+                            is_local ? 0.30
+                                     : runtime.reloc_config.max_pose_jump_m;
                     const double jump = relocalization::TranslationDistance(
                             attempt.T_live_to_world,
                             last_stable_T_frame_to_model);
-                    if (jump > runtime.reloc_config.max_pose_jump_m) {
+                    if (jump > max_jump) {
                         last_reloc_attempt.accepted = false;
                         last_reloc_attempt.reject_reason =
                                 "pose jump too large (apply)";
                         utility::LogWarning(
-                                "Global reloc result dropped at frame {} "
+                                "{} reloc result dropped at frame {} "
                                 "(stale jump {:.2f} m).",
-                                frame_id, jump);
+                                is_local ? "Local" : "Global", frame_id, jump);
                     } else {
                         T_frame_to_model =
                                 attempt.T_live_to_world.Contiguous();
-                        global_reloc_recovering = true;
-                        consecutive_strong = 0;
+                        if (is_local) {
+                            ++close_counters.local_kf_accept;
+                            // Local ICP is a pose seed only; require strong
+                            // model tracking again before integrate.
+                            tracking_was_unstable = true;
+                            consecutive_strong = 0;
+                            quality_hold_recovering = true;
+                            quality_hold_strong_streak = 0;
+                        } else {
+                            global_reloc_recovering = true;
+                            consecutive_strong = 0;
+                            ++close_counters.global_reloc;
+                        }
                         {
                             std::lock_guard<std::mutex> model_lock(
                                     runtime.model_mutex);
@@ -1161,15 +1693,17 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                             hypotheses_initialized = true;
                         }
                         hypothesis_tracker.AddOrReplace(
-                                "global", T_frame_to_model, attempt.keyframe_id);
+                                is_local ? "local_kf" : "global",
+                                T_frame_to_model, attempt.keyframe_id);
                         utility::LogInfo(
-                                "Global relocalization accepted at frame {} "
+                                "{} relocalization accepted at frame {} "
                                 "(from request frame {}, KF#{}, icp "
                                 "{:.3f}, info {:.3f}, {:.0f} ms).",
-                                frame_id, result_frame, attempt.keyframe_id,
+                                is_local ? "Local" : "Global", frame_id,
+                                result_frame, attempt.keyframe_id,
                                 attempt.icp_fitness, attempt.information_ratio,
                                 elapsed_ms);
-                        if (runtime.reloc_self_test.enabled &&
+                        if (!is_local && runtime.reloc_self_test.enabled &&
                             reloc_self_test_injected &&
                             !runtime.reloc_self_test_finished.load()) {
                             reloc_self_test_global_ok = true;
@@ -1184,7 +1718,9 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                     }
                 } else if (runtime.reloc_self_test.enabled &&
                            reloc_self_test_injected &&
-                           !runtime.reloc_self_test_finished.load()) {
+                           !runtime.reloc_self_test_finished.load() &&
+                           result_mode ==
+                                   SlamRuntime::RelocRequestMode::kGlobal) {
                     // Async: keep waiting until timeout unless hard reject.
                     utility::LogWarning(
                             "RELOC_SELF_TEST: reloc rejected ({}); waiting "
@@ -1196,7 +1732,52 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             }
         }
 
-        // Queue async reloc (query from last_stable, not drifted pose).
+        // Queue async local keyframe ICP before escalating to global reloc.
+        if (params.close_guard.enabled && runtime.reloc_config.enabled &&
+            depth_flags.close_risk &&
+            consecutive_close_weak >=
+                    params.close_guard.local_icp_after_weak_frames &&
+            consecutive_tracking_failures <= kLostTrackingThreshold &&
+            keyframe_db.Size() > 0 &&
+            frame_id - last_local_icp_frame >=
+                    params.close_guard.local_icp_rate_limit_frames &&
+            !runtime.reloc_worker_busy.load() &&
+            !runtime.reloc_requested.load()) {
+            const auto recent = keyframe_db.SnapshotRecentEntries(3);
+            if (!recent.empty()) {
+                std::vector<int> ids;
+                ids.reserve(recent.size());
+                for (const auto& entry : recent) {
+                    ids.push_back(entry.id);
+                }
+                last_local_icp_frame = frame_id;
+                const int request_id = runtime.next_reloc_request_id++;
+                {
+                    std::lock_guard<std::mutex> lock(runtime.reloc_mutex);
+                    runtime.pending_reloc_rgbd = rgbd.To(core::Device("CPU:0"));
+                    runtime.pending_reloc_intrinsic = intrinsic;
+                    runtime.pending_reloc_last_stable =
+                            last_stable_T_frame_to_model.Contiguous();
+                    runtime.pending_reloc_init_pose =
+                            T_frame_to_model.Contiguous();
+                    runtime.pending_reloc_candidate_ids = ids;
+                    runtime.pending_reloc_mode =
+                            SlamRuntime::RelocRequestMode::kLocalIcp;
+                    runtime.pending_reloc_frame_id = frame_id;
+                    runtime.pending_reloc_request_id = request_id;
+                    runtime.pending_reloc_depth_scale = params.depth_scale;
+                    runtime.pending_reloc_depth_max = params.depth_max;
+                    runtime.pending_reloc_used_fallback = false;
+                    runtime.reloc_requested.store(true);
+                }
+                runtime.reloc_cv.notify_one();
+                utility::LogInfo(
+                        "Local ICP queued at frame {} ({} recent keyframes).",
+                        frame_id, ids.size());
+            }
+        }
+
+        // Queue async global reloc (query from last_stable, not drifted pose).
         if (runtime.reloc_config.enabled && tracking_was_unstable &&
             !global_reloc_recovering &&
             consecutive_tracking_failures > kLostTrackingThreshold &&
@@ -1232,7 +1813,11 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                     runtime.pending_reloc_intrinsic = intrinsic;
                     runtime.pending_reloc_last_stable =
                             last_stable_T_frame_to_model.Contiguous();
+                    runtime.pending_reloc_init_pose =
+                            last_stable_T_frame_to_model.Contiguous();
                     runtime.pending_reloc_candidate_ids = selection.ids;
+                    runtime.pending_reloc_mode =
+                            SlamRuntime::RelocRequestMode::kGlobal;
                     runtime.pending_reloc_frame_id = frame_id;
                     runtime.pending_reloc_request_id = request_id;
                     runtime.pending_reloc_depth_scale = params.depth_scale;
@@ -1263,6 +1848,12 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 consecutive_tracking_failures > kLostTrackingThreshold &&
                 (frame_id % kModelRetryIntervalWhenLost) != 0 &&
                 !global_reloc_attempt_frame;
+
+        const bool use_close_seed_probe =
+                params.close_guard.enabled && frame_id > 0 &&
+                !prefer_f2f_bridge &&
+                (depth_flags.close_risk || tracking_was_unstable ||
+                 consecutive_tracking_failures > 0);
 
         if (frame_id > 0 && tracking_was_unstable && !prefer_f2f_bridge &&
             hypothesis_tracker.HasHypotheses()) {
@@ -1323,6 +1914,91 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             }
         }
 
+        // Close-risk / weak: compare current vs capped velocity prediction seeds.
+        if (use_close_seed_probe && have_prev_strong_pose) {
+            core::Tensor predicted_T;
+            if (PredictPoseFromVelocity(
+                        prev_strong_T_frame_to_model,
+                        last_strong_T_frame_to_model,
+                        params.close_guard.predict_max_translation_m,
+                        params.close_guard.predict_max_rotation_deg,
+                        predicted_T)) {
+                core::Tensor pose_before;
+                {
+                    std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
+                    pose_before = model.GetCurrentFramePose();
+                }
+                auto probe_seed =
+                        [&](const std::string& label,
+                            const core::Tensor& seed) -> SeedProbeCandidate {
+                            SeedProbeCandidate cand;
+                            cand.label = label;
+                            cand.seed_T = seed.Contiguous();
+                            cand.delta_T = identity_pose;
+                            try {
+                                std::lock_guard<std::mutex> model_lock(
+                                        runtime.model_mutex);
+                                model.UpdateFramePose(frame_id, seed);
+                                model.SynthesizeModelFrame(
+                                        raycast_frame, params.depth_scale, 0.1f,
+                                        params.depth_max,
+                                        params.trunc_multiplier, false);
+                                auto result = model.TrackFrameToModel(
+                                        input_frame, raycast_frame,
+                                        params.depth_scale, params.depth_max,
+                                        SafeOdometryDepthDiff(
+                                                params.depth_diff),
+                                        t::pipelines::odometry::Method::
+                                                PointToPlane,
+                                        odom_criteria);
+                                cand.fitness = result.fitness_;
+                                cand.delta_T = result.transformation_;
+                                const double t =
+                                        TranslationNorm(result.transformation_);
+                                const double r =
+                                        RotationAngleDeg(result.transformation_);
+                                cand.tier = ClassifyTracking(cand.fitness, t, r);
+                                const double jump =
+                                        relocalization::TranslationDistance(
+                                                seed,
+                                                last_stable_T_frame_to_model);
+                                cand.score = cand.fitness - 0.05 * jump;
+                                model.UpdateFramePose(frame_id, pose_before);
+                            } catch (...) {
+                                cand.fitness = 0.0;
+                                cand.tier = TrackingTier::kFail;
+                                cand.score = -1.0;
+                                try {
+                                    std::lock_guard<std::mutex> model_lock(
+                                            runtime.model_mutex);
+                                    model.UpdateFramePose(frame_id,
+                                                          pose_before);
+                                } catch (...) {
+                                }
+                            }
+                            return cand;
+                        };
+                SeedProbeCandidate best = probe_seed("current", T_frame_to_model);
+                SeedProbeCandidate predicted =
+                        probe_seed("predicted", predicted_T);
+                if (IsBetterSeedCandidate(predicted, best) &&
+                    predicted.tier != TrackingTier::kOutlier) {
+                    best = predicted;
+                    ++close_counters.predicted_win;
+                    utility::LogInfo(
+                            "Predicted seed selected at frame {} (fitness "
+                            "{:.3f}, score {:.3f}).",
+                            frame_id, best.fitness, best.score);
+                }
+                if (best.tier != TrackingTier::kOutlier &&
+                    best.fitness >= kWeakFitnessMin) {
+                    T_frame_to_model = best.seed_T.Contiguous();
+                    hypothesis_tracker.AddOrReplace(best.label, T_frame_to_model,
+                                                    -1);
+                }
+            }
+        }
+
         const int recovery_streak_required =
                 tracking_was_unstable
                         ? (global_reloc_recovering
@@ -1341,12 +2017,12 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             tracking_tier = TrackingTier::kFail;
             try {
                 auto run_model_tracking =
-                        [&](float depth_diff) {
+                        [&](float depth_diff,
+                            t::pipelines::odometry::Method method) {
                             return model.TrackFrameToModel(
                                     input_frame, raycast_frame,
                                     params.depth_scale, params.depth_max,
-                                    SafeOdometryDepthDiff(depth_diff),
-                                    t::pipelines::odometry::Method::PointToPlane,
+                                    SafeOdometryDepthDiff(depth_diff), method,
                                     odom_criteria);
                         };
 
@@ -1354,31 +2030,95 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 double track_fitness = 0.0;
                 double track_translation = 0.0;
                 double track_rotation = 0.0;
+                t::pipelines::odometry::Method used_method =
+                        t::pipelines::odometry::Method::PointToPlane;
+                bool singular_ptp = false;
                 {
                     std::lock_guard<std::mutex> model_lock(runtime.model_mutex);
-                    auto result = run_model_tracking(params.depth_diff);
-                    track_fitness = result.fitness_;
-                    track_transform = result.transformation_;
-                    track_translation =
-                            TranslationNorm(result.transformation_);
-                    track_rotation = RotationAngleDeg(result.transformation_);
-                    tracking_tier =
-                            ClassifyTracking(track_fitness, track_translation,
-                                             track_rotation);
-
-                    if (tracking_tier == TrackingTier::kFail &&
-                        track_fitness < kWeakFitnessMin) {
-                        result = run_model_tracking(params.depth_diff * 2.0f);
+                    try {
+                        auto result = run_model_tracking(
+                                params.depth_diff,
+                                t::pipelines::odometry::Method::PointToPlane);
                         track_fitness = result.fitness_;
                         track_transform = result.transformation_;
                         track_translation =
                                 TranslationNorm(result.transformation_);
                         track_rotation =
                                 RotationAngleDeg(result.transformation_);
-                        tracking_tier =
-                                ClassifyTracking(track_fitness,
-                                                 track_translation,
-                                                 track_rotation);
+                        tracking_tier = ClassifyTracking(
+                                track_fitness, track_translation,
+                                track_rotation);
+
+                        if (tracking_tier == TrackingTier::kFail &&
+                            track_fitness < kWeakFitnessMin) {
+                            result = run_model_tracking(
+                                    params.depth_diff * 2.0f,
+                                    t::pipelines::odometry::Method::
+                                            PointToPlane);
+                            track_fitness = result.fitness_;
+                            track_transform = result.transformation_;
+                            track_translation =
+                                    TranslationNorm(result.transformation_);
+                            track_rotation =
+                                    RotationAngleDeg(result.transformation_);
+                            tracking_tier = ClassifyTracking(
+                                    track_fitness, track_translation,
+                                    track_rotation);
+                        }
+                    } catch (const std::exception& e) {
+                        if (IsOdometrySingularError(e)) {
+                            singular_ptp = true;
+                            tracking_tier = TrackingTier::kFail;
+                            track_fitness = 0.0;
+                        } else {
+                            throw;
+                        }
+                    }
+
+                    const bool try_hybrid =
+                            params.close_guard.enabled &&
+                            (depth_flags.close_risk || singular_ptp ||
+                             tracking_tier == TrackingTier::kFail ||
+                             tracking_tier == TrackingTier::kWeak ||
+                             track_fitness < kPoseFitnessMin);
+                    if (try_hybrid) {
+                        try {
+                            auto hybrid = run_model_tracking(
+                                    params.depth_diff,
+                                    t::pipelines::odometry::Method::Hybrid);
+                            const double h_fit = hybrid.fitness_;
+                            const double h_t =
+                                    TranslationNorm(hybrid.transformation_);
+                            const double h_r =
+                                    RotationAngleDeg(hybrid.transformation_);
+                            const TrackingTier h_tier =
+                                    ClassifyTracking(h_fit, h_t, h_r);
+                            SeedProbeCandidate ptp_cand;
+                            ptp_cand.tier = tracking_tier;
+                            ptp_cand.fitness = track_fitness;
+                            ptp_cand.score = track_fitness;
+                            SeedProbeCandidate hyb_cand;
+                            hyb_cand.tier = h_tier;
+                            hyb_cand.fitness = h_fit;
+                            hyb_cand.score = h_fit;
+                            if (IsBetterSeedCandidate(hyb_cand, ptp_cand) &&
+                                h_tier != TrackingTier::kOutlier) {
+                                track_fitness = h_fit;
+                                track_transform = hybrid.transformation_;
+                                track_translation = h_t;
+                                track_rotation = h_r;
+                                tracking_tier = h_tier;
+                                used_method =
+                                        t::pipelines::odometry::Method::Hybrid;
+                                ++close_counters.hybrid_win;
+                            }
+                        } catch (const std::exception& he) {
+                            if (!IsOdometrySingularError(he)) {
+                                utility::LogWarning(
+                                        "Hybrid probe failed at frame {}: {}",
+                                        frame_id, he.what());
+                            }
+                        }
                     }
                 }
                 // Motion gate uses net pose vs anchor + hash growth (not
@@ -1389,20 +2129,46 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                             T_frame_to_model.Matmul(track_transform);
                     ++consecutive_strong;
                     consecutive_tracking_failures = 0;
-                    if (!tracking_was_unstable) {
+                    consecutive_close_weak = 0;
+                    if (quality_hold_recovering) {
+                        ++quality_hold_strong_streak;
+                    }
+                    const bool quality_ok_to_integrate =
+                            !quality_hold_recovering ||
+                            quality_hold_strong_streak >=
+                                    params.close_guard
+                                            .strong_frames_to_resume_integrate;
+                    if (!tracking_was_unstable && quality_ok_to_integrate) {
                         T_frame_to_model = candidate_T_frame_to_model;
                         integrate = !hash_near_full;
+                        if (quality_hold_recovering &&
+                            quality_hold_strong_streak >=
+                                    params.close_guard
+                                            .strong_frames_to_resume_integrate) {
+                            quality_hold_recovering = false;
+                            utility::LogInfo(
+                                    "Quality-hold integration resumed at "
+                                    "frame {}.",
+                                    frame_id);
+                        }
+                    } else if (!tracking_was_unstable &&
+                               !quality_ok_to_integrate) {
+                        T_frame_to_model = candidate_T_frame_to_model;
+                        integrate = false;
+                        ++rejected_pose_updates;
                     } else if (tracking_was_unstable &&
                                consecutive_strong >= recovery_streak_required &&
                                IsRecoveryPoseStable(track_fitness,
                                                     track_translation,
-                                                    track_rotation)) {
+                                                    track_rotation) &&
+                               quality_ok_to_integrate) {
                         T_frame_to_model = candidate_T_frame_to_model;
                         integrate = !hash_near_full;
                         tracking_was_unstable = false;
                         global_reloc_recovering = false;
                         hypotheses_initialized = false;
                         consecutive_f2f_bridges = 0;
+                        quality_hold_recovering = false;
                         if (lost_camera_marker_visible) {
                             state.SetLostCameraMarker(nullptr, false);
                             state.SetCurrentCameraMarker(nullptr, false);
@@ -1412,9 +2178,15 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                         }
                         utility::LogInfo(
                                 "Tracking restabilized at frame {} — "
-                                "resuming integration.",
-                                frame_id);
+                                "resuming integration{}.",
+                                frame_id,
+                                used_method == t::pipelines::odometry::Method::
+                                                       Hybrid
+                                        ? " (Hybrid)"
+                                        : "");
                     } else if (tracking_was_unstable) {
+                        // Keep pose seed for raycast/f2f but do not integrate.
+                        T_frame_to_model = candidate_T_frame_to_model;
                         utility::LogWarning(
                                 "Recovery candidate frame {} held from "
                                 "integration (strong streak {}, fitness {:.3f}, "
@@ -1426,8 +2198,14 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 } else {
                     consecutive_strong = 0;
                     consecutive_f2f_bridges = 0;
+                    quality_hold_strong_streak = 0;
                     tracking_was_unstable = true;
                     ++consecutive_tracking_failures;
+                    if (params.close_guard.enabled &&
+                        (depth_flags.close_risk ||
+                         tracking_tier == TrackingTier::kWeak)) {
+                        ++consecutive_close_weak;
+                    }
                     const char* tier_name = TrackingTierName(tracking_tier);
                     utility::LogWarning(
                             "Tracking {} for frame {}, fitness: {:.3f}, "
@@ -1441,8 +2219,12 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                 tracking_tier = TrackingTier::kFail;
                 consecutive_strong = 0;
                 consecutive_f2f_bridges = 0;
+                quality_hold_strong_streak = 0;
                 tracking_was_unstable = true;
                 ++consecutive_tracking_failures;
+                if (params.close_guard.enabled && depth_flags.close_risk) {
+                    ++consecutive_close_weak;
+                }
                 if (IsOdometrySingularError(e)) {
                     utility::LogWarning(
                             "Odometry singular at frame {} (low overlap or "
@@ -1459,8 +2241,16 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             tracking_tier = TrackingTier::kWeak;
         }
 
-        if (frame_id > 0 && tracking_was_unstable && !prev_rgbd.IsEmpty() &&
-            tracking_tier != TrackingTier::kStrong) {
+        const bool proactive_f2f =
+                params.close_guard.enabled && frame_id > 0 &&
+                !prev_rgbd.IsEmpty() &&
+                tracking_tier != TrackingTier::kStrong &&
+                (depth_flags.close_risk || tracking_was_unstable ||
+                 consecutive_tracking_failures > 0);
+
+        if (frame_id > 0 && !prev_rgbd.IsEmpty() &&
+            tracking_tier != TrackingTier::kStrong &&
+            (tracking_was_unstable || proactive_f2f)) {
             try {
                 auto f2f_result =
                         t::pipelines::odometry::RGBDOdometryMultiScale(
@@ -1482,6 +2272,12 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                             T_frame_to_model.Matmul(f2f_result.transformation_);
                     ++consecutive_f2f_bridges;
                     ++f2f_bridge_successes;
+                    if (proactive_f2f &&
+                        consecutive_tracking_failures <=
+                                kLostTrackingThreshold) {
+                        ++close_counters.proactive_f2f;
+                    }
+                    hypothesis_tracker.AddOrReplace("f2f", T_frame_to_model, -1);
                     // Pose bridge keeps raycasting near the current camera view,
                     // but integration stays disabled until model tracking
                     // restabilizes against the TSDF.
@@ -1526,6 +2322,17 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
                         "Integrate/raycast failed at frame {}: {}", frame_id,
                         e.what());
             }
+        }
+
+        if (tracking_tier == TrackingTier::kStrong || integrate) {
+            if (have_prev_strong_pose) {
+                prev_strong_T_frame_to_model =
+                        last_strong_T_frame_to_model.Contiguous();
+            } else {
+                prev_strong_T_frame_to_model = T_frame_to_model.Contiguous();
+                have_prev_strong_pose = true;
+            }
+            last_strong_T_frame_to_model = T_frame_to_model.Contiguous();
         }
 
         if (integrate) {
@@ -1771,6 +2578,14 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         } else if (frame_id > 0 && tracking_tier != TrackingTier::kStrong) {
             status += " | tracking " + std::string(TrackingTierName(tracking_tier));
         }
+        if (params.close_guard.enabled && depth_flags.close_risk) {
+            std::ostringstream oss;
+            oss << " | TOO CLOSE | back up | valid=" << std::fixed
+                << std::setprecision(2) << last_depth_metrics.valid_ratio
+                << " near=" << last_depth_metrics.near_ratio
+                << " median=" << last_depth_metrics.median_depth << "m";
+            status += oss.str();
+        }
         state.SetStatus(status);
 
         std::string reloc_detail;
@@ -1965,6 +2780,18 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             frame_id, integrated_frames, integrate_ratio,
             trajectory->parameters_.size(), f2f_bridge_successes,
             rejected_pose_updates);
+    if (params.close_guard.enabled) {
+        utility::LogInfo(
+                "Close-tracking summary: close_risk={}, quality_hold={}, "
+                "hybrid_win={}, predicted_win={}, proactive_f2f={}, "
+                "local_kf_accept={}, global_reloc={} "
+                "(last valid={:.2f} near={:.2f} median={:.2f}m).",
+                close_counters.close_risk, close_counters.quality_hold,
+                close_counters.hybrid_win, close_counters.predicted_win,
+                close_counters.proactive_f2f, close_counters.local_kf_accept,
+                close_counters.global_reloc, last_depth_metrics.valid_ratio,
+                last_depth_metrics.near_ratio, last_depth_metrics.median_depth);
+    }
     if (integrate_ratio < 50.0 && frame_id > 30) {
         utility::LogWarning(
                 "Less than half of frames were integrated. Rescan slowly with "
@@ -1982,6 +2809,9 @@ int main(int argc, char* argv[]) {
     if (utility::ProgramOptionExistsAny(argc, argv, {"-h", "--help"})) {
         PrintHelp();
         return 1;
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--close_tracking_self_test")) {
+        return RunCloseTrackingSelfTest() ? 0 : 1;
     }
     if (argc <= 1) {
         utility::LogInfo(
@@ -2254,6 +3084,29 @@ int main(int argc, char* argv[]) {
                 "RELOC_SELF_TEST mode: warmup {} frames, inject drift, run "
                 "global reloc, then exit.",
                 runtime.reloc_self_test.warmup_frames);
+    }
+
+    if (utility::ProgramOptionExists(argc, argv, "--no_close_tracking_guard")) {
+        params.close_guard.enabled = false;
+        utility::LogInfo("Close-tracking guard disabled.");
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--close_depth")) {
+        params.close_guard.close_depth_m = static_cast<float>(
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--close_depth",
+                        params.close_guard.close_depth_m));
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--close_near_ratio")) {
+        params.close_guard.close_near_ratio = static_cast<float>(
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--close_near_ratio",
+                        params.close_guard.close_near_ratio));
+    }
+    if (utility::ProgramOptionExists(argc, argv, "--close_min_valid_ratio")) {
+        params.close_guard.critical_valid_ratio = static_cast<float>(
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--close_min_valid_ratio",
+                        params.close_guard.critical_valid_ratio));
     }
 
     const std::string device_code =
