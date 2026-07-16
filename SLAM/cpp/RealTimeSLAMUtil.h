@@ -291,7 +291,7 @@ public:
         panel_->AddFixed(vspacing);
 
         pose_diff_title_ =
-                std::make_shared<gui::Label>("Relocalization guidance");
+                std::make_shared<gui::Label>("Return guidance");
         panel_->AddChild(pose_diff_title_);
         pose_diff_label_ = std::make_shared<gui::Label>("");
         pose_diff_label_->SetFontId(monospace);
@@ -622,7 +622,7 @@ private:
         reloc_guide_line_ = *line;
         MaterialRecord mat;
         mat.shader = "unlitLine";
-        mat.line_width = 4.0f;
+        mat.line_width = 5.0f;
         scene->AddGeometry("reloc_guide", &reloc_guide_line_, mat);
         reloc_guide_line_added_ = true;
     }

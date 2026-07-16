@@ -95,6 +95,9 @@ void PrintHelp() {
     utility::LogInfo("    [--region_max_void_ratio R] Max local void ratio (default: 0.08).");
     utility::LogInfo("    [--region_max_void_blob N] Max connected void cells (default: 32).");
     utility::LogInfo("    [--region_max_boundary_void R] Max boundary void ratio (default: 0.10).");
+    utility::LogInfo("    [--region_min_hole_perimeter M] Min interior loop perimeter m (default: 0.03).");
+    utility::LogInfo("    [--region_max_hole_loops N] Max interior boundary loops (default: 0).");
+    utility::LogInfo("    [--region_min_weight_coverage R] Min TSDF reliable-cell ratio (default: 0.70).");
     utility::LogInfo("    [--region_extract_weight W] Region TSDF extract weight (default: 3.0).");
     utility::LogInfo("    [--region_depth_min M] Camera-distance band min meters (default: 0.3).");
     utility::LogInfo("    [--region_depth_max M] Camera-distance band max (default: min(2.5, depth_max)).");
@@ -223,6 +226,27 @@ int main(int argc, char* argv[]) {
                 utility::GetProgramOptionAsDouble(
                         argc, argv, "--region_max_boundary_void",
                         region_settings.max_boundary_void_ratio);
+    }
+    if (utility::ProgramOptionExists(argc, argv,
+                                     "--region_min_hole_perimeter")) {
+        region_settings.min_hole_loop_perimeter_m =
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_min_hole_perimeter",
+                        region_settings.min_hole_loop_perimeter_m);
+    }
+    if (utility::ProgramOptionExists(argc, argv,
+                                     "--region_max_hole_loops")) {
+        region_settings.max_interior_hole_loops =
+                utility::GetProgramOptionAsInt(
+                        argc, argv, "--region_max_hole_loops",
+                        region_settings.max_interior_hole_loops);
+    }
+    if (utility::ProgramOptionExists(argc, argv,
+                                     "--region_min_weight_coverage")) {
+        region_settings.min_tsdf_weight_coverage =
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_min_weight_coverage",
+                        region_settings.min_tsdf_weight_coverage);
     }
     if (utility::ProgramOptionExists(argc, argv, "--region_extract_weight")) {
         region_settings.extract_weight = static_cast<float>(

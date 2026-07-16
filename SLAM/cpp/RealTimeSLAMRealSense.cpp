@@ -147,6 +147,9 @@ void PrintHelp() {
     utility::LogInfo("    [--region_max_void_ratio R] Max local void ratio (default: 0.08).");
     utility::LogInfo("    [--region_max_void_blob N] Max connected void cells (default: 32).");
     utility::LogInfo("    [--region_max_boundary_void R] Max boundary void ratio (default: 0.10).");
+    utility::LogInfo("    [--region_min_hole_perimeter M] Min interior loop perimeter m (default: 0.03).");
+    utility::LogInfo("    [--region_max_hole_loops N] Max interior boundary loops (default: 0).");
+    utility::LogInfo("    [--region_min_weight_coverage R] Min TSDF reliable-cell ratio (default: 0.70).");
     utility::LogInfo("    [--region_extract_weight W] Region TSDF extract weight (default: 3.0).");
     utility::LogInfo("    [--region_depth_min M] Camera-distance band min meters (default: 0.3).");
     utility::LogInfo("    [--region_depth_max M] Camera-distance band max (default: min(2.5, depth_max)).");
@@ -342,38 +345,122 @@ std::shared_ptr<geometry::LineSet> CreateCameraMarker(
 const Eigen::Vector3d kLastStableCameraColor(0.961, 0.475, 0.000);
 /// Current estimated pose while lost: cyan/blue (where you are now).
 const Eigen::Vector3d kCurrentCameraColor(0.15, 0.55, 1.00);
+/// World up matches SceneWidget LookAt (0, -1, 0).
+const Eigen::Vector3d kWorldUp(0.0, -1.0, 0.0);
+constexpr double kRelocArrowMinDistM = 0.02;
+constexpr double kRelocTurnMinHorizM = 0.05;
+constexpr double kLastStableFrustumScale = 0.35;
+constexpr double kCurrentFrustumScale = 0.18;
 
-std::string BuildPoseDiffText(const core::Tensor& stable_T_frame_to_model,
-                              const core::Tensor& current_T_frame_to_model) {
-    const Eigen::Matrix4d stable =
-            core::eigen_converter::TensorToEigenMatrixXd(
-                    stable_T_frame_to_model);
-    const Eigen::Matrix4d current =
-            core::eigen_converter::TensorToEigenMatrixXd(
-                    current_T_frame_to_model);
-    const Eigen::Matrix4d diff = stable.inverse() * current;
-    const Eigen::Vector3d delta = diff.block<3, 1>(0, 3);
-    const Eigen::Vector3d euler_deg =
-            diff.block<3, 3>(0, 0).eulerAngles(0, 1, 2) * 180.0 /
-            3.14159265358979323846;
-    const double trace = diff.block<3, 3>(0, 0).trace();
-    const double cos_angle = std::max(-1.0, std::min(1.0, (trace - 1.0) * 0.5));
-    const double angle_deg =
-            std::acos(cos_angle) * 180.0 / 3.14159265358979323846;
+/// Body-relative return metrics in last_stable horizontal yaw frame.
+struct RelocBodyGuidance {
+    double fwd = 0.0;    // + = move along last_stable look direction
+    double right = 0.0;  // + = move right
+    double up = 0.0;     // + = move up (world -Y)
+    double dist = 0.0;
+    double turn_deg = 0.0;  // + = turn right toward target
+    bool turn_valid = false;
+};
 
+Eigen::Vector3d HorizontalUnit(const Eigen::Vector3d& v,
+                               const Eigen::Vector3d& up) {
+    Eigen::Vector3d h = v - up * v.dot(up);
+    const double n = h.norm();
+    if (n < 1e-6) {
+        return Eigen::Vector3d::Zero();
+    }
+    return h / n;
+}
+
+RelocBodyGuidance ComputeRelocBodyGuidance(
+        const core::Tensor& last_stable_T,
+        const core::Tensor& current_T) {
+    RelocBodyGuidance g;
+    const Eigen::Matrix4d T_s =
+            core::eigen_converter::TensorToEigenMatrixXd(last_stable_T);
+    const Eigen::Matrix4d T_c =
+            core::eigen_converter::TensorToEigenMatrixXd(current_T);
+    const Eigen::Vector3d p_s = T_s.block<3, 1>(0, 3);
+    const Eigen::Vector3d p_c = T_c.block<3, 1>(0, 3);
+    const Eigen::Vector3d v = p_s - p_c;
+    g.dist = v.norm();
+
+    const Eigen::Vector3d up = kWorldUp.normalized();
+    Eigen::Vector3d forward_h = HorizontalUnit(T_s.block<3, 1>(0, 2), up);
+    if (forward_h.norm() < 1e-6) {
+        // Looking nearly vertical: fall back to last_stable +X on ground.
+        forward_h = HorizontalUnit(T_s.block<3, 1>(0, 0), up);
+    }
+    if (forward_h.norm() < 1e-6) {
+        forward_h = Eigen::Vector3d(0.0, 0.0, 1.0);
+    }
+    Eigen::Vector3d right_h = forward_h.cross(up);
+    const double right_n = right_h.norm();
+    if (right_n < 1e-6) {
+        right_h = Eigen::Vector3d(1.0, 0.0, 0.0);
+    } else {
+        right_h /= right_n;
+    }
+
+    g.fwd = v.dot(forward_h);
+    g.right = v.dot(right_h);
+    g.up = v.dot(up);
+
+    const Eigen::Vector3d v_h = HorizontalUnit(v, up);
+    const Eigen::Vector3d cur_fwd_h =
+            HorizontalUnit(T_c.block<3, 1>(0, 2), up);
+    const double horiz_dist = (v - up * v.dot(up)).norm();
+    if (horiz_dist >= kRelocTurnMinHorizM && v_h.norm() > 1e-6 &&
+        cur_fwd_h.norm() > 1e-6) {
+        const double cross_y = cur_fwd_h.cross(v_h).dot(up);
+        const double dot = std::max(-1.0, std::min(1.0, cur_fwd_h.dot(v_h)));
+        g.turn_deg = std::atan2(cross_y, dot) * 180.0 /
+                     3.14159265358979323846;
+        g.turn_valid = true;
+    }
+    return g;
+}
+
+std::string BuildBodyRelativeGuidanceText(
+        const core::Tensor& last_stable_T,
+        const core::Tensor& current_T) {
+    const RelocBodyGuidance g =
+            ComputeRelocBodyGuidance(last_stable_T, current_T);
     std::ostringstream ss;
-    ss << std::fixed << std::setprecision(3);
-    ss << "Orange: last stable  |  Blue: current\n";
-    ss << "Return toward orange camera\n";
-    ss << "dX " << delta.x() << " m\n";
-    ss << "dY " << delta.y() << " m\n";
-    ss << "dZ " << delta.z() << " m\n";
-    ss << "dist " << delta.norm() << " m\n";
-    ss << std::setprecision(1);
-    ss << "rot " << angle_deg << " deg\n";
-    ss << "rX " << euler_deg.x() << " deg\n";
-    ss << "rY " << euler_deg.y() << " deg\n";
-    ss << "rZ " << euler_deg.z() << " deg";
+    ss << std::fixed << std::setprecision(2);
+    ss << "Return to orange\n";
+    if (std::abs(g.fwd) < 0.005) {
+        ss << "fwd/back  0.00 m\n";
+    } else if (g.fwd >= 0.0) {
+        ss << "fwd   " << g.fwd << " m\n";
+    } else {
+        ss << "back  " << -g.fwd << " m\n";
+    }
+    if (std::abs(g.right) < 0.005) {
+        ss << "left/right  0.00 m\n";
+    } else if (g.right >= 0.0) {
+        ss << "right " << g.right << " m\n";
+    } else {
+        ss << "left  " << -g.right << " m\n";
+    }
+    if (std::abs(g.up) < 0.005) {
+        ss << "up/down  0.00 m\n";
+    } else if (g.up >= 0.0) {
+        ss << "up    " << g.up << " m\n";
+    } else {
+        ss << "down  " << -g.up << " m\n";
+    }
+    ss << "dist  " << g.dist << " m\n";
+    if (g.turn_valid) {
+        ss << std::setprecision(0);
+        if (std::abs(g.turn_deg) < 0.5) {
+            ss << "turn  0 deg";
+        } else if (g.turn_deg >= 0.0) {
+            ss << "turn right " << g.turn_deg << " deg";
+        } else {
+            ss << "turn left " << -g.turn_deg << " deg";
+        }
+    }
     return ss.str();
 }
 
@@ -781,18 +868,46 @@ void RelocWorker(SlamRuntime& runtime) {
     }
 }
 
-std::shared_ptr<geometry::LineSet> CreateRelocGuideLine(
+/// Orange arrow from current translation toward last_stable (return target).
+std::shared_ptr<geometry::LineSet> CreateRelocGuideArrow(
         const core::Tensor& last_stable_T,
         const core::Tensor& current_T) {
-    const Eigen::Vector3d a = relocalization::PoseTranslation(last_stable_T);
-    const Eigen::Vector3d b = relocalization::PoseTranslation(current_T);
-    auto line = std::make_shared<geometry::LineSet>();
-    line->points_ = {a, b};
-    line->lines_ = {Eigen::Vector2i(0, 1)};
-    line->colors_ = {Eigen::Vector3d(0.961, 0.475, 0.000),
-                     Eigen::Vector3d(0.961, 0.475, 0.000)};
-    line->PaintUniformColor(Eigen::Vector3d(0.961, 0.475, 0.000));
-    return line;
+    const Eigen::Vector3d p_s =
+            relocalization::PoseTranslation(last_stable_T);
+    const Eigen::Vector3d p_c = relocalization::PoseTranslation(current_T);
+    const Eigen::Vector3d v = p_s - p_c;
+    const double dist = v.norm();
+    if (dist < kRelocArrowMinDistM) {
+        return nullptr;
+    }
+    const Eigen::Vector3d dir = v / dist;
+    const Eigen::Vector3d up = kWorldUp.normalized();
+    Eigen::Vector3d side = dir.cross(up);
+    if (side.norm() < 1e-6) {
+        side = dir.cross(Eigen::Vector3d(1.0, 0.0, 0.0));
+    }
+    if (side.norm() < 1e-6) {
+        side = dir.cross(Eigen::Vector3d(0.0, 0.0, 1.0));
+    }
+    side.normalize();
+    const Eigen::Vector3d side2 = dir.cross(side).normalized();
+
+    const double head_len = std::min(0.12, dist * 0.25);
+    const double head_width = head_len * 0.45;
+    const Eigen::Vector3d tip = p_s;
+    const Eigen::Vector3d shaft_end = tip - dir * head_len;
+    const Eigen::Vector3d base = p_c;
+
+    auto arrow = std::make_shared<geometry::LineSet>();
+    arrow->points_ = {
+            base, shaft_end, tip,
+            shaft_end + side * head_width, shaft_end - side * head_width,
+            shaft_end + side2 * head_width, shaft_end - side2 * head_width};
+    arrow->lines_ = {Eigen::Vector2i(0, 1), Eigen::Vector2i(1, 2),
+                     Eigen::Vector2i(2, 3), Eigen::Vector2i(2, 4),
+                     Eigen::Vector2i(2, 5), Eigen::Vector2i(2, 6)};
+    arrow->PaintUniformColor(kLastStableCameraColor);
+    return arrow;
 }
 
 void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
@@ -1439,7 +1554,8 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             state.SetLostCameraMarker(
                     CreateCameraMarker(width, height, intrinsic_eigen,
                                        last_stable_T_frame_to_model,
-                                       kLastStableCameraColor),
+                                       kLastStableCameraColor,
+                                       kLastStableFrustumScale),
                     true);
             lost_camera_marker_visible = true;
             // Hide keyframe spheres — they clutter the view and do not mark
@@ -1447,27 +1563,29 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
             state.SetShowKeyframeMarkers(false);
             state.SetKeyframeMarkers({});
             utility::LogInfo(
-                    "Tracking lost. Orange=last stable, blue=current pose; "
-                    "return toward the orange camera frustum.");
+                    "Tracking lost. Orange arrow + body HUD; return to "
+                    "orange frustum.");
         }
         if (consecutive_tracking_failures > kLostTrackingThreshold) {
             state.SetLostCameraMarker(
                     CreateCameraMarker(width, height, intrinsic_eigen,
                                        last_stable_T_frame_to_model,
-                                       kLastStableCameraColor),
+                                       kLastStableCameraColor,
+                                       kLastStableFrustumScale),
                     true);
             state.SetCurrentCameraMarker(
                     CreateCameraMarker(width, height, intrinsic_eigen,
-                                       T_frame_to_model, kCurrentCameraColor),
+                                       T_frame_to_model, kCurrentCameraColor,
+                                       kCurrentFrustumScale),
                     true);
             state.SetPoseDiffText(
-                    BuildPoseDiffText(last_stable_T_frame_to_model,
-                                      T_frame_to_model),
+                    BuildBodyRelativeGuidanceText(
+                            last_stable_T_frame_to_model, T_frame_to_model),
                     true);
-            state.SetRelocGuideLine(
-                    CreateRelocGuideLine(last_stable_T_frame_to_model,
-                                         T_frame_to_model),
-                    true);
+            auto guide_arrow = CreateRelocGuideArrow(
+                    last_stable_T_frame_to_model, T_frame_to_model);
+            state.SetRelocGuideLine(guide_arrow,
+                                   guide_arrow != nullptr);
         } else if (lost_camera_marker_visible) {
             state.SetCurrentCameraMarker(nullptr, false);
             state.SetRelocGuideLine(nullptr, false);
@@ -1700,7 +1818,8 @@ void SlamWorker(std::function<t::geometry::RGBDImage()> capture_frame,
         state.SetRelocDetail(reloc_detail);
 
         // Keyframe spheres are debug-only (toggle). Reloc guidance uses
-        // orange last-stable + blue current camera frustums instead.
+        // orange last-stable frustum, blue current frustum, body HUD, and
+        // orange return arrow.
         if (runtime.reloc_config.enabled && state.ShowKeyframeMarkers() &&
             frame_id - last_keyframe_marker_publish >= params.update_interval) {
             std::vector<Eigen::Vector3d> markers;
@@ -1995,6 +2114,27 @@ int main(int argc, char* argv[]) {
                 utility::GetProgramOptionAsDouble(
                         argc, argv, "--region_max_boundary_void",
                         params.regions.max_boundary_void_ratio);
+    }
+    if (utility::ProgramOptionExists(argc, argv,
+                                     "--region_min_hole_perimeter")) {
+        params.regions.min_hole_loop_perimeter_m =
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_min_hole_perimeter",
+                        params.regions.min_hole_loop_perimeter_m);
+    }
+    if (utility::ProgramOptionExists(argc, argv,
+                                     "--region_max_hole_loops")) {
+        params.regions.max_interior_hole_loops =
+                utility::GetProgramOptionAsInt(
+                        argc, argv, "--region_max_hole_loops",
+                        params.regions.max_interior_hole_loops);
+    }
+    if (utility::ProgramOptionExists(argc, argv,
+                                     "--region_min_weight_coverage")) {
+        params.regions.min_tsdf_weight_coverage =
+                utility::GetProgramOptionAsDouble(
+                        argc, argv, "--region_min_weight_coverage",
+                        params.regions.min_tsdf_weight_coverage);
     }
     if (utility::ProgramOptionExists(argc, argv, "--region_extract_weight")) {
         params.regions.extract_weight = static_cast<float>(

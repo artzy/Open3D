@@ -121,6 +121,13 @@ struct SegmentationConfig {
     double max_void_ratio = 0.08;
     int max_void_blob_cells = 32;
     double max_boundary_void_ratio = 0.10;
+    /// Topological holes: ignore loops below this perimeter and reject larger
+    /// interior boundary loops. The effective minimum is at least 4 voxels.
+    double min_hole_loop_perimeter_m = 0.03;
+    int max_interior_hole_loops = 0;
+    /// Reliable TSDF surface cells (mesh threshold) / all observed surface
+    /// cells (weight >= 1). Low coverage defers freeze for more observations.
+    double min_tsdf_weight_coverage = 0.70;
 };
 
 struct RegionReadinessReport {
@@ -140,6 +147,15 @@ struct RegionVoidReport {
     int max_void_blob = 0;
     double void_ratio_before_sanitize = 0.0;
     double void_ratio_after_sanitize = 0.0;
+    int boundary_loop_count = 0;
+    int interior_hole_loops = 0;
+    int open_boundary_chains = 0;
+    int non_manifold_edges = 0;
+    double max_hole_perimeter_m = 0.0;
+    double hole_perimeter_ratio = 0.0;
+    int tsdf_observed_cells = 0;
+    int tsdf_reliable_cells = 0;
+    double tsdf_weight_coverage = 0.0;
 };
 
 inline void RelativePoseMetrics(const core::Tensor& T_from,
@@ -279,6 +295,151 @@ inline double ComputeMeshBoundaryRatio(const geometry::TriangleMesh& mesh) {
            static_cast<double>(total_edges);
 }
 
+struct MeshBoundaryLoopReport {
+    int boundary_loop_count = 0;
+    int interior_hole_loops = 0;
+    int open_boundary_chains = 0;
+    int non_manifold_edges = 0;
+    double max_hole_perimeter_m = 0.0;
+    double hole_perimeter_ratio = 0.0;
+};
+
+/// Finds connected boundary components per connected triangle component.
+/// The largest closed boundary of each surface component is its outer border;
+/// additional closed boundaries above min_hole_perimeter are interior holes.
+inline MeshBoundaryLoopReport ComputeMeshBoundaryLoopReport(
+        const geometry::TriangleMesh& mesh,
+        double min_hole_perimeter) {
+    MeshBoundaryLoopReport report;
+    if (mesh.vertices_.empty() || mesh.triangles_.empty()) {
+        return report;
+    }
+
+    const auto [triangle_component, component_sizes, component_areas] =
+            mesh.ClusterConnectedTriangles();
+    (void)component_sizes;
+    (void)component_areas;
+    int component_count = 0;
+    for (int component : triangle_component) {
+        component_count = std::max(component_count, component + 1);
+    }
+    if (component_count == 0) {
+        return report;
+    }
+
+    struct EdgeUse {
+        int a = -1;
+        int b = -1;
+        int count = 0;
+        int component = -1;
+    };
+    std::unordered_map<uint64_t, EdgeUse> edge_uses;
+    edge_uses.reserve(mesh.triangles_.size() * 3);
+    auto edge_key = [](int a, int b) {
+        if (a > b) {
+            std::swap(a, b);
+        }
+        return (static_cast<uint64_t>(a) << 32) |
+               static_cast<uint32_t>(b);
+    };
+    auto add_edge = [&](int a, int b, int component) {
+        if (a > b) {
+            std::swap(a, b);
+        }
+        EdgeUse& use = edge_uses[edge_key(a, b)];
+        if (use.count == 0) {
+            use.a = a;
+            use.b = b;
+            use.component = component;
+        }
+        ++use.count;
+    };
+    for (size_t i = 0; i < mesh.triangles_.size(); ++i) {
+        const Eigen::Vector3i& tri = mesh.triangles_[i];
+        const int component = triangle_component[i];
+        add_edge(tri(0), tri(1), component);
+        add_edge(tri(1), tri(2), component);
+        add_edge(tri(2), tri(0), component);
+    }
+
+    std::vector<std::unordered_map<int, std::vector<int>>> adjacency(
+            static_cast<size_t>(component_count));
+    for (const auto& [key, use] : edge_uses) {
+        (void)key;
+        if (use.count > 2) {
+            ++report.non_manifold_edges;
+        }
+        if (use.count == 1 && use.component >= 0) {
+            adjacency[static_cast<size_t>(use.component)][use.a].push_back(
+                    use.b);
+            adjacency[static_cast<size_t>(use.component)][use.b].push_back(
+                    use.a);
+        }
+    }
+
+    double total_outer_perimeter = 0.0;
+    double total_hole_perimeter = 0.0;
+    for (auto& graph : adjacency) {
+        std::unordered_set<int> visited;
+        std::vector<double> closed_perimeters;
+        for (const auto& [start, neighbors] : graph) {
+            (void)neighbors;
+            if (visited.count(start)) {
+                continue;
+            }
+            std::queue<int> pending_vertices;
+            pending_vertices.push(start);
+            visited.insert(start);
+            bool closed = true;
+            double doubled_perimeter = 0.0;
+            while (!pending_vertices.empty()) {
+                const int vertex = pending_vertices.front();
+                pending_vertices.pop();
+                const auto& adjacent = graph.at(vertex);
+                if (adjacent.size() != 2) {
+                    closed = false;
+                }
+                for (int neighbor : adjacent) {
+                    doubled_perimeter +=
+                            (mesh.vertices_[static_cast<size_t>(vertex)] -
+                             mesh.vertices_[static_cast<size_t>(neighbor)])
+                                    .norm();
+                    if (visited.insert(neighbor).second) {
+                        pending_vertices.push(neighbor);
+                    }
+                }
+            }
+            const double perimeter = doubled_perimeter * 0.5;
+            if (closed && perimeter > 0.0) {
+                closed_perimeters.push_back(perimeter);
+                ++report.boundary_loop_count;
+            } else {
+                ++report.open_boundary_chains;
+            }
+        }
+        if (closed_perimeters.empty()) {
+            continue;
+        }
+        std::sort(closed_perimeters.begin(), closed_perimeters.end(),
+                  std::greater<double>());
+        total_outer_perimeter += closed_perimeters.front();
+        for (size_t i = 1; i < closed_perimeters.size(); ++i) {
+            if (closed_perimeters[i] < min_hole_perimeter) {
+                continue;
+            }
+            ++report.interior_hole_loops;
+            total_hole_perimeter += closed_perimeters[i];
+            report.max_hole_perimeter_m =
+                    std::max(report.max_hole_perimeter_m,
+                             closed_perimeters[i]);
+        }
+    }
+    report.hole_perimeter_ratio =
+            total_hole_perimeter /
+            std::max(total_outer_perimeter + total_hole_perimeter, 1e-9);
+    return report;
+}
+
 struct GridIndex3 {
     int x = 0;
     int y = 0;
@@ -295,6 +456,23 @@ struct GridIndex3Hash {
                (static_cast<size_t>(k.z) * 83492791u);
     }
 };
+
+inline int CountGlobalSurfaceCells(
+        const std::vector<Eigen::Vector3d>& points,
+        double cell_size) {
+    if (points.empty() || cell_size <= 0.0) {
+        return 0;
+    }
+    std::unordered_set<GridIndex3, GridIndex3Hash> cells;
+    cells.reserve(points.size());
+    for (const auto& point : points) {
+        cells.insert(GridIndex3{
+                static_cast<int>(std::floor(point.x() / cell_size)),
+                static_cast<int>(std::floor(point.y() / cell_size)),
+                static_cast<int>(std::floor(point.z() / cell_size))});
+    }
+    return static_cast<int>(cells.size());
+}
 
 inline void CollectPointCells(
         const std::vector<Eigen::Vector3d>& points,
@@ -423,6 +601,17 @@ inline RegionVoidReport ComputeLocalVoidFromPoints(
 inline bool PassesVoidGate(const RegionVoidReport& void_report,
                            const SegmentationConfig& config,
                            bool flush) {
+    const bool topology_ok =
+            void_report.interior_hole_loops <=
+                    config.max_interior_hole_loops &&
+            void_report.non_manifold_edges == 0;
+    const double min_weight_coverage =
+            config.min_tsdf_weight_coverage * (flush ? 0.85 : 1.0);
+    const bool weight_ok =
+            void_report.tsdf_weight_coverage >= min_weight_coverage;
+    if (!topology_ok || !weight_ok) {
+        return false;
+    }
     if (flush) {
         return void_report.void_ratio <= config.max_void_ratio * 1.5 &&
                void_report.max_void_blob <=
@@ -654,12 +843,24 @@ public:
             utility::LogInfo(
                     "Region candidate {} deferred (void): void_ratio={:.2f} "
                     "(before_sanitize={:.2f} after={:.2f}) max_blob={} "
-                    "boundary_void={:.2f} readiness={:.2f} ({}/{})",
+                    "boundary_void={:.2f} holes={}/{} ratio={:.2f} "
+                    "max_hole={:.3f}m "
+                    "open_chains={} non_manifold={} tsdf_weight={:.2f} "
+                    "({}/{}) readiness={:.2f} ({}/{})",
                     id, void_report.void_ratio,
                     void_report.void_ratio_before_sanitize,
                     void_report.void_ratio_after_sanitize,
                     void_report.max_void_blob, void_report.boundary_void_ratio,
-                    readiness, tracked.hole_defer_attempts,
+                    void_report.interior_hole_loops,
+                    void_report.boundary_loop_count,
+                    void_report.hole_perimeter_ratio,
+                    void_report.max_hole_perimeter_m,
+                    void_report.open_boundary_chains,
+                    void_report.non_manifold_edges,
+                    void_report.tsdf_weight_coverage,
+                    void_report.tsdf_reliable_cells,
+                    void_report.tsdf_observed_cells, readiness,
+                    tracked.hole_defer_attempts,
                     config_.max_holey_defer_attempts);
             return;
         }
@@ -1475,14 +1676,28 @@ inline RegionVoidReport ComputeRegionVoidReport(
     }
 
     std::vector<Eigen::Vector3d> surface_points;
+    std::vector<Eigen::Vector3d> observed_surface_points;
     if (!IsEmptyBlockKeys(candidate.block_keys)) {
         try {
+            const float reliable_weight =
+                    std::max(weight_threshold, config.mesh_weight_threshold);
             t::geometry::PointCloud surface =
                     model.voxel_grid_.ExtractPointCloudIncluding(
-                            weight_threshold, -1, candidate.block_keys);
+                            reliable_weight, -1, candidate.block_keys);
             surface = surface.To(core::Device("CPU:0"));
             if (surface.HasPointPositions()) {
                 surface_points = surface.ToLegacy().points_;
+            }
+        } catch (const std::exception&) {
+        }
+        try {
+            t::geometry::PointCloud observed_surface =
+                    model.voxel_grid_.ExtractPointCloudIncluding(
+                            1.0f, -1, candidate.block_keys);
+            observed_surface = observed_surface.To(core::Device("CPU:0"));
+            if (observed_surface.HasPointPositions()) {
+                observed_surface_points =
+                        observed_surface.ToLegacy().points_;
             }
         } catch (const std::exception&) {
         }
@@ -1490,10 +1705,15 @@ inline RegionVoidReport ComputeRegionVoidReport(
     if (surface_points.empty() && cluster.HasPointPositions()) {
         surface_points = cluster.ToLegacy().points_;
     }
+    if (observed_surface_points.empty()) {
+        observed_surface_points = surface_points;
+    }
 
     std::vector<Eigen::Vector3d> mesh_vertices;
+    geometry::TriangleMesh legacy_mesh;
     if (candidate.mesh.HasVertexPositions()) {
-        mesh_vertices = candidate.mesh.ToLegacy().vertices_;
+        legacy_mesh = candidate.mesh.ToLegacy();
+        mesh_vertices = legacy_mesh.vertices_;
     }
 
     std::vector<Eigen::Vector3d> boundary_centers;
@@ -1517,6 +1737,30 @@ inline RegionVoidReport ComputeRegionVoidReport(
     report.void_ratio_after_sanitize = report.void_ratio;
     report.void_ratio_before_sanitize =
             (before_sanitize > 0.0) ? before_sanitize : report.void_ratio;
+
+    const double min_hole_perimeter =
+            std::max(config.min_hole_loop_perimeter_m,
+                     static_cast<double>(config.voxel_size) * 4.0);
+    const MeshBoundaryLoopReport boundary_report =
+            ComputeMeshBoundaryLoopReport(legacy_mesh, min_hole_perimeter);
+    report.boundary_loop_count = boundary_report.boundary_loop_count;
+    report.interior_hole_loops = boundary_report.interior_hole_loops;
+    report.open_boundary_chains = boundary_report.open_boundary_chains;
+    report.non_manifold_edges = boundary_report.non_manifold_edges;
+    report.max_hole_perimeter_m = boundary_report.max_hole_perimeter_m;
+    report.hole_perimeter_ratio = boundary_report.hole_perimeter_ratio;
+
+    const double weight_cell =
+            std::max(0.01, static_cast<double>(config.voxel_size) * 2.0);
+    report.tsdf_observed_cells =
+            CountGlobalSurfaceCells(observed_surface_points, weight_cell);
+    report.tsdf_reliable_cells =
+            CountGlobalSurfaceCells(surface_points, weight_cell);
+    report.tsdf_weight_coverage =
+            static_cast<double>(report.tsdf_reliable_cells) /
+            static_cast<double>(std::max(report.tsdf_observed_cells, 1));
+    report.tsdf_weight_coverage =
+            std::max(0.0, std::min(1.0, report.tsdf_weight_coverage));
     return report;
 }
 
@@ -1541,12 +1785,19 @@ inline void CommitRegionFreeze(FrozenObjectCandidate& candidate,
             candidate.mesh.GetTriangleIndices().GetLength();
     utility::LogInfo(
             "Region candidate {} committed (triangles={}, blocks={}, "
-            "readiness={:.2f}, void={:.2f}->{:.2f}, boundary_void={:.2f}).",
+            "readiness={:.2f}, void={:.2f}->{:.2f}, boundary_void={:.2f}, "
+            "holes={}/{} ratio={:.2f}, tsdf_weight={:.2f} ({}/{})).",
             candidate.id, triangle_count, BlockKeyCount(candidate.block_keys),
             candidate.readiness.score,
             candidate.void_report.void_ratio_before_sanitize,
             candidate.void_report.void_ratio_after_sanitize,
-            candidate.void_report.boundary_void_ratio);
+            candidate.void_report.boundary_void_ratio,
+            candidate.void_report.interior_hole_loops,
+            candidate.void_report.boundary_loop_count,
+            candidate.void_report.hole_perimeter_ratio,
+            candidate.void_report.tsdf_weight_coverage,
+            candidate.void_report.tsdf_reliable_cells,
+            candidate.void_report.tsdf_observed_cells);
     candidate.source_cluster = t::geometry::PointCloud();
 }
 
@@ -2129,6 +2380,9 @@ struct RegionParams {
     double max_void_ratio = 0.08;
     int max_void_blob_cells = 32;
     double max_boundary_void_ratio = 0.10;
+    double min_hole_loop_perimeter_m = 0.03;
+    int max_interior_hole_loops = 0;
+    double min_tsdf_weight_coverage = 0.70;
     /// TSDF weight for region surface extract (display extract stays separate).
     float extract_weight = 3.0f;
     /// Camera-distance band for region input (meters from camera origin).
@@ -2187,6 +2441,12 @@ inline SegmentationConfig BuildLiveRegionSegmentationConfig(
     config.max_void_ratio = region_params.max_void_ratio;
     config.max_void_blob_cells = region_params.max_void_blob_cells;
     config.max_boundary_void_ratio = region_params.max_boundary_void_ratio;
+    config.min_hole_loop_perimeter_m =
+            region_params.min_hole_loop_perimeter_m;
+    config.max_interior_hole_loops =
+            region_params.max_interior_hole_loops;
+    config.min_tsdf_weight_coverage =
+            region_params.min_tsdf_weight_coverage;
     config.max_cluster_extent_m = region_params.max_cluster_extent_m;
     return config;
 }
