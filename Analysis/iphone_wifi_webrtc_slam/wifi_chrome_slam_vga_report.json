@@ -1,0 +1,44 @@
+{
+  "host": "192.168.0.110",
+  "method": "playwright-chromium + Open3D SLAM (640x480 Wi-Fi)",
+  "metadata": {
+    "K": [
+      1343.744140625,
+      0,
+      0,
+      0,
+      1343.744140625,
+      0,
+      720.1293334960938,
+      966.7929077148438,
+      1
+    ],
+    "originalSize": [
+      1440,
+      1920
+    ],
+    "type": "metadata"
+  },
+  "stats": {
+    "frames": 60,
+    "integrated": 60,
+    "track_ok": 59,
+    "track_fail": 0,
+    "max_hash": 724,
+    "video_wh": [
+      870,
+      582
+    ],
+    "native_wh": [
+      870,
+      582
+    ],
+    "slam_wh": [
+      640,
+      480
+    ],
+    "voxel": 0.012,
+    "ply": "D:\\study\\Open3D\\Analysis\\iphone_wifi_webrtc_slam\\wifi_chrome_slam_vga_points.ply"
+  },
+  "note": "No ARKit pose on Wi-Fi Streaming; RGB-D odometry only."
+}

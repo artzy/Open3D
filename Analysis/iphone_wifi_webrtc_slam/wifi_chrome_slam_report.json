@@ -1,0 +1,34 @@
+{
+  "host": "192.168.0.110",
+  "method": "playwright-chromium + Open3D CPU SLAM",
+  "metadata": {
+    "K": [
+      1355.9744873046875,
+      0,
+      0,
+      0,
+      1355.9744873046875,
+      0,
+      719.1779174804688,
+      966.84326171875,
+      1
+    ],
+    "originalSize": [
+      1440,
+      1920
+    ],
+    "type": "metadata"
+  },
+  "stats": {
+    "frames": 50,
+    "integrated": 50,
+    "track_ok": 49,
+    "track_fail": 0,
+    "max_hash": 131,
+    "video_wh": [
+      640,
+      428
+    ]
+  },
+  "note": "No ARKit pose on Wi-Fi Streaming; RGB-D odometry only."
+}
