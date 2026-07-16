@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B4A1D7E3-2F5C-8A9B-0D1E-3F6C5B7A9E2D}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>IPhoneSLAMRealSense</RootNamespace>
+    <ProjectName>IPhoneSLAMRealSense</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="Open3DExample.props" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(ProjectDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(ProjectName)\$(Configuration)\</IntDir>
+    <TargetName>IPhoneSLAMRealSense</TargetName>
+    <TargetPath>$(OutDir)$(TargetName)$(TargetExt)</TargetPath>
+    <LocalDebuggerCommand>$(TargetPath)</LocalDebuggerCommand>
+    <LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory>
+    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(ProjectName)\$(Configuration)\</IntDir>
+    <TargetName>IPhoneSLAMRealSense</TargetName>
+    <TargetPath>$(OutDir)$(TargetName)$(TargetExt)</TargetPath>
+    <LocalDebuggerCommand>$(TargetPath)</LocalDebuggerCommand>
+    <LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory>
+    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(Open3DRoot)\3rdparty\record3d\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "$(Open3DRoot)/3rdparty/record3d/include"</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(Open3DRoot)\3rdparty\record3d\build\$(Configuration)\record3d_cpp.lib;$(Open3DRoot)\3rdparty\record3d\build\libs\win\lzfse-lzfse-1.0\$(Configuration)\lzfse.lib;$(Open3DRoot)\3rdparty\record3d\build\libs\win\libusbmuxd\$(Configuration)\usbmuxd.lib;$(Open3DRoot)\3rdparty\record3d\build\libs\win\libusbmuxd\libs\libplist\$(Configuration)\plist.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(Open3DRoot)\3rdparty\record3d\build\$(Configuration);$(Open3DRoot)\3rdparty\record3d\build\libs\win\lzfse-lzfse-1.0\$(Configuration);$(Open3DRoot)\3rdparty\record3d\build\libs\win\libusbmuxd\$(Configuration);$(Open3DRoot)\3rdparty\record3d\build\libs\win\libusbmuxd\libs\libplist\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+    <PostBuildEvent>
+      <Command>robocopy "$(BuildRoot)\bin\resources" "$(ProjectDir)resources" /E /NFL /NDL /NJH /NJS /nc /ns /np /IS /IT &gt;nul
+if %ERRORLEVEL% GEQ 8 exit /b %ERRORLEVEL%
+if "$(Configuration)"=="Debug" (
+  copy /Y "$(BuildRoot)\msvc_19.44_cxx17_64_mt_debug\tbb12_debug.dll" "$(TargetDir)"
+) else (
+  copy /Y "$(BuildRoot)\msvc_19.44_cxx17_64_mt_release\tbb12.dll" "$(TargetDir)"
+)
+copy /Y "D:\GitHub\vcpkg\installed\x64-windows\bin\zlib1.dll" "$(TargetDir)" 2&gt;nul</Command>
+      <Message>Sync Open3D resources and copy runtime DLLs</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="cpp\IPhoneSLAMRealSense.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="cpp\IPhoneCapture.h" />
+    <ClInclude Include="cpp\RealTimeSLAMUtil.h" />
+    <ClInclude Include="cpp\ObjectMeshPipeline.h" />
+    <ClInclude Include="cpp\Relocalization.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

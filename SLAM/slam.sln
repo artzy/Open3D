@@ -9,6 +9,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "OnlineSLAMRealSense", "Onli
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RealTimeSLAMRealSense", "RealTimeSLAMRealSense.vcxproj", "{A3F8C9D2-1E4B-6F7A-9C0D-2E5B4A6C8D1E}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "IPhoneSLAMRealSense", "IPhoneSLAMRealSense.vcxproj", "{B4A1D7E3-2F5C-8A9B-0D1E-3F6C5B7A9E2D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -27,6 +29,10 @@ Global
 		{A3F8C9D2-1E4B-6F7A-9C0D-2E5B4A6C8D1E}.Debug|x64.Build.0 = Debug|x64
 		{A3F8C9D2-1E4B-6F7A-9C0D-2E5B4A6C8D1E}.Release|x64.ActiveCfg = Release|x64
 		{A3F8C9D2-1E4B-6F7A-9C0D-2E5B4A6C8D1E}.Release|x64.Build.0 = Release|x64
+		{B4A1D7E3-2F5C-8A9B-0D1E-3F6C5B7A9E2D}.Debug|x64.ActiveCfg = Debug|x64
+		{B4A1D7E3-2F5C-8A9B-0D1E-3F6C5B7A9E2D}.Debug|x64.Build.0 = Debug|x64
+		{B4A1D7E3-2F5C-8A9B-0D1E-3F6C5B7A9E2D}.Release|x64.ActiveCfg = Release|x64
+		{B4A1D7E3-2F5C-8A9B-0D1E-3F6C5B7A9E2D}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
